@@ -1,0 +1,48 @@
+[style]
+# Base the style on Google Python Style Guide
+based_on_style = google
+
+# Use 4 spaces for indentation (common in ML projects like NerfStudio)
+indent_width = 2
+
+# Set column width limit for readability
+column_limit = 100
+
+# Indent dictionary values for better readability
+indent_dictionary_value = true
+
+# Split arguments into separate lines when a comma is present at the end
+split_arguments_when_comma_terminated = true
+
+# Prevent joining multiple logical lines into one
+join_multiple_lines = false
+
+# Do not split before the first argument in function calls (less aggressive splitting)
+split_before_first_argument = false
+
+# Do not dedent closing brackets (as per your preference)
+dedent_closing_brackets = false
+
+# Ensure a single blank line between nested class/method definitions
+blank_line_before_nested_class_or_def = true
+
+# Do not align closing brackets with visual indentation (as per your preference)
+align_closing_bracket_with_visual_indent = false
+
+# Split complex comprehensions for better readability
+split_complex_comprehension = true
+
+# Allow splitting before dictionary values (common in ML code for long dicts)
+allow_split_before_dict_value = true
+
+# Split before closing brackets
+split_before_closing_bracket = true
+
+# Do not split expressions immediately after opening parentheses
+split_before_expression_after_opening_paren = false
+
+# Coalesce brackets to avoid unnecessary newlines
+coalesce_brackets = true
+
+# Add spaces around list delimiters (e.g., [a, b, c])
+spaces_around_list_delimiters = true

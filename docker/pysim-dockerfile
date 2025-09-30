@@ -1,0 +1,51 @@
+# Use a specific Ubuntu base image for reproducibility
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+ARG DISPLAY=:0
+ENV DISPLAY=$DISPLAY
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    software-properties-common \
+    git \
+    python3-pip \
+    python3-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir \
+    numpy \
+    typing-extensions \
+    pytest \
+    future \
+    cachetools \
+    jupyter-client \
+    traitlets \
+    gin-config \
+    jupyter notebook \
+    tensorboard \
+    absl-py \
+    yapf \
+    scipy \
+    scikit-image \
+    matplotlib \
+    scikit-learn \
+    seaborn \
+    mediapy \
+    imageio \
+    rawpy \
+    optuna \
+    scikit-optimize \
+    hyperopt \
+    pyomo \
+    flax \
+    cr-sparse \
+    jaxopt \
+    optimistix 
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+WORKDIR /pysim
+
+EXPOSE 8888 
+EXPOSE 6666
