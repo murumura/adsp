@@ -4,7 +4,7 @@ import flax.linen as nn
 import numpy as np
 import scipy
 from scipy import signal
-from typing import Callable, Tuple, Dict, Any, Optional, Union
+from typing import Callable, Tuple, Dict, Any, Optional, Union, List
 # Plotting and Analysis Functions
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
@@ -297,22 +297,22 @@ class LMS(nn.Module):
     return y_hist, e_hist, w_hist
 
 
-# --------------------------------------------------
-# Base Adaptive Problem Class
-# --------------------------------------------------
 class AdaptiveProblem(ABC):
 
   def __init__(self,
                lms: Any,
                gen_signals_fn: Callable,
+               n_ensemble: int = 1,
                wiener_sol_fn: Optional[Callable] = None,
-               seed: int = 42):
+               seed: int = 42,
+               **kwargs):
     """
       Base class for adaptive filtering problems.
       
       Args:
           lms: LMS filter instance
           gen_signals_fn: Function that generates signals for the specific problem
+          n_ensemble: Number of ensemble members
           wiener_sol_fn: Function to compute Wiener solution (optional)
           seed: Random seed
     """
@@ -320,34 +320,246 @@ class AdaptiveProblem(ABC):
     self.gen_signals_fn = gen_signals_fn
     self.key = jax.random.PRNGKey(seed)
     self.wiener_sol_fn = wiener_sol_fn
-
-    # Initialize with dummy signals
+    self.n_ensemble = n_ensemble
     self.vars = self.initialize_filter()
+    # Fixed parameters for misadjustment calculation
+    self.sigma_x2 = kwargs.get('sigma_x2', 1.0)
 
+    # Get theoretical misadjustment value from kwargs or use default
+    # function to compute it
+    self.theoretical_misadjustment_val = kwargs.get(
+        'theoretical_misadjustment_val', 
+        None
+    )
+    
   def initialize_filter(self) -> _Array:
     """Initialize filter variables with dummy signals"""
     dummy_x = jnp.zeros(10, dtype=jnp.float64)
     dummy_d = jnp.zeros(10, dtype=jnp.float64)
     return self.lms.init(self.key, dummy_x, dummy_d)
 
-  def generate_signals(self, n_samples: int, *args, **kwargs) -> Tuple:
+  def generate_signals(self, n_samples: int, ensemble_idx: int = 0, **kwargs) -> Tuple:
     """Generate signals for the specific problem"""
-    self.key, subkey = jax.random.split(self.key)
-    return self.gen_signals_fn(n_samples, key=subkey)
+    ensemble_key = jax.random.fold_in(self.key, ensemble_idx)
+    signals = self.gen_signals_fn(n_samples, key=ensemble_key, **kwargs)
+  
+    # Handle different signal return formats
+    if len(signals) == 2:
+        x, d = signals
+        return None, x, d, None
+    elif len(signals) == 3:
+        x, d, channel_info = signals
+        return None, x, d, None
+    else:
+        return signals
 
-  def run_adaptation(self,
-                     x: _Array,
-                     d: _Array,
-                     training: bool = True) -> Tuple[_Array, _Array, _Array]:
+  def run_adaptation(self, x: _Array, d: _Array, training: bool = True) -> Tuple[_Array, _Array, _Array]:
     """Run LMS adaptation on given signals"""
     return self.lms.apply(self.vars, x, d, train=training)
 
-  @abstractmethod
-  def run(self, n_samples: int, training: bool = True):
+  def _stack_h_true_ensemble(self, all_h_true: List) -> Any:
+    """Stack h_true ensemble with proper shape handling"""
+    if all_h_true[0] is None:
+        return None
+    
+    first_h = all_h_true[0]
+    if first_h.ndim == 1:  # Stationary channel
+        return first_h
+    elif first_h.ndim == 2:  # Time-varying
+        return jnp.stack(all_h_true)
+    else:
+        return first_h
+  
+  def run(self, n_samples: int, training: bool = True, **kwargs):
     """Run the complete adaptive filtering experiment"""
-    pass
+    ensemble_data = self._collect_ensemble_data(n_samples, training, **kwargs)
+    ensemble_metrics = self._compute_ensemble_metrics(ensemble_data)
+    
+    return (ensemble_data['w_hist'], ensemble_data['e_hist'], 
+            ensemble_metrics, ensemble_data['return_h_true'])
 
-  def default_wiener_solution(self, x: _Array, d: _Array) -> Tuple[_Array, _Array, _Array]:
+  def _collect_ensemble_data(self, n_samples: int, training: bool = True, **kwargs):
+    """Collect ensemble data efficiently"""
+    all_w_hist, all_e_hist, all_h_true, all_x_hist, all_d_hist, all_measured_noise = [], [], [], [], [], []
+    
+    for i in range(self.n_ensemble):
+        h_true, x, d, measured_noise = self.generate_signals(n_samples, ensemble_idx=i, **kwargs)
+        _, e_hist, w_hist = self.run_adaptation(x, d, training)
+        
+        all_w_hist.append(w_hist)
+        all_e_hist.append(e_hist)
+        all_h_true.append(h_true)
+        all_x_hist.append(x)
+        all_d_hist.append(d)
+        all_measured_noise.append(measured_noise)
+        
+    return {
+        'w_hist': jnp.stack(all_w_hist),
+        'e_hist': jnp.stack(all_e_hist),
+        'x_hist': jnp.stack(all_x_hist),
+        'd_hist': jnp.stack(all_d_hist),
+        'h_true': all_h_true,
+        'measured_noise': all_measured_noise,
+        'return_h_true': self._stack_h_true_ensemble(all_h_true)
+    }
+
+  def _compute_ensemble_metrics(self, ensemble_data: Dict) -> Dict[str, Any]:
+    """Compute all ensemble metrics in one place"""
+    all_x_hist, all_d_hist = ensemble_data['x_hist'], ensemble_data['d_hist']
+    all_w_hist, all_e_hist = ensemble_data['w_hist'], ensemble_data['e_hist']
+    all_h_true, all_measured_noise = ensemble_data['h_true'], ensemble_data['measured_noise']
+    
+    n_ensemble, n_samples = all_e_hist.shape
+    
+    # Core metrics
+    avg_mse_curve = jnp.mean(jnp.abs(all_e_hist)**2, axis=0)
+    w_opt_ensemble, R_ensemble, p_ensemble = self.ensemble_wiener_solution(all_x_hist, all_d_hist)
+    avg_w_error = jnp.mean(jnp.linalg.norm(all_w_hist - w_opt_ensemble, axis=2), axis=0)
+    
+    # Final metrics
+    last_n = min(100, n_samples)
+    final_mse = jnp.mean(avg_mse_curve[-last_n:])
+    #final_mse = jnp.sum(avg_mse_curve[-last_n:]) / n_ensemble
+    final_coeff = jnp.mean(all_w_hist[:, -1, :], axis=0)
+    
+    # Noise handling
+    min_mse_ensemble = self._compute_min_mse(all_measured_noise, avg_mse_curve, last_n)
+    
+    # Misadjustment
+    mu = self.step_size()
+    trace_R = jnp.trace(R_ensemble)
+    misadjustment = (final_mse - min_mse_ensemble) / min_mse_ensemble if min_mse_ensemble > 0 else 0.0
+    
+    if self.theoretical_misadjustment_val is None:
+        theoretical_misadjustment = self._default_misadjustment_fn(mu, trace_R)
+    else:
+        theoretical_misadjustment = self.theoretical_misadjustment_val
+        
+    misadjustment_curve = (avg_mse_curve - min_mse_ensemble) / min_mse_ensemble
+    
+    # Convergence analysis
+    convergence_metrics = self.analyze_convergence(all_e_hist, all_w_hist, all_h_true[0] if all_h_true[0] is not None else None, w_opt_ensemble)
+    
+    # Base metrics
+    ensemble_metrics = {
+        "wiener_solution": w_opt_ensemble,
+        "R": R_ensemble,
+        "p": p_ensemble,
+        "final_coeff": final_coeff,
+        "final_mse": final_mse,
+        "final_coeff_error": jnp.mean(avg_w_error[-last_n:]),
+        "step_size" : self.step_size(),
+        "avg_mse_curve": avg_mse_curve,
+        "avg_coeff_error_curve": avg_w_error,
+        "min_mse": min_mse_ensemble,
+        "misadjustment": misadjustment,
+        "misadjustment_theoretical": theoretical_misadjustment,
+        "misadjustment_curve" : misadjustment_curve,
+        "n_ensemble": self.n_ensemble,
+        "eigenvalues": jnp.linalg.eigvals(R_ensemble),
+        "max_eigenvalue": jnp.max(jnp.real(jnp.linalg.eigvals(R_ensemble))),
+        "min_eigenvalue": jnp.min(jnp.real(jnp.linalg.eigvals(R_ensemble))),
+        "trace_R": trace_R,
+        **convergence_metrics  # Include convergence metrics
+    }
+    
+    # Add h_true metrics if available
+    ensemble_metrics.update(self._compute_h_true_metrics(all_w_hist, all_h_true, last_n))
+    
+    # Problem-specific metrics
+    return self._add_problem_specific_metrics(ensemble_metrics, ensemble_data)
+
+  def _default_misadjustment_fn(self, mu: float, trace_R : float) -> float:
+    """
+    Default misadjustment calculation with proper stability check
+    
+    Args:
+        mu: Convergence factor
+        trace_R: Trace of input correlation matrix
+        sigma_n2: Measurement noise variance
+        
+    Returns:
+        Theoretical misadjustment value
+    """
+    # Check stability condition
+    if mu * trace_R >= 1:
+        return float('inf')  # Unstable case
+    
+    return (mu * trace_R) / (1 - mu * trace_R)
+    
+  def _compute_min_mse(self, all_measured_noise: List, avg_mse_curve: _Array, last_n: int) -> float:
+    """Compute minimum MSE from noise or steady-state"""
+    if all_measured_noise[0] is not None:
+        all_noise_stacked = jnp.stack([jnp.abs(noise)**2 for noise in all_measured_noise])
+        return jnp.mean(all_noise_stacked)
+    else:
+        return jnp.mean(avg_mse_curve[-last_n:])
+
+  def _compute_h_true_metrics(self, all_w_hist: _Array, all_h_true: List, last_n: int) -> Dict[str, Any]:
+    """Compute metrics related to true system coefficients"""
+    if all_h_true[0] is None:
+        return {}
+        
+    first_h_true = all_h_true[0]
+    metrics = {}
+    
+    if first_h_true.ndim == 1:  # Stationary
+        avg_coeff_error_true = jnp.mean(jnp.linalg.norm(all_w_hist - first_h_true, axis=2), axis=0)
+        metrics.update({
+            "avg_coeff_error_true_curve": avg_coeff_error_true,
+            "final_coeff_error_true": jnp.mean(avg_coeff_error_true[-last_n:]),
+            "unknown_system": first_h_true,
+        })
+    elif first_h_true.ndim == 2:  # Time-varying
+        all_h_true_stacked = jnp.stack(all_h_true)
+        coeff_error_true = jnp.linalg.norm(all_w_hist - all_h_true_stacked, axis=2)
+        avg_coeff_error_true = jnp.mean(coeff_error_true, axis=0)
+        metrics.update({
+            "avg_coeff_error_true_curve": avg_coeff_error_true,
+            "final_coeff_error_true": jnp.mean(avg_coeff_error_true[-last_n:]),
+            "unknown_system": all_h_true_stacked[0],
+            "h_true_ensemble": all_h_true_stacked,
+        })
+    
+    return metrics
+
+  def analyze_convergence(self, e_hist: _Array, w_hist: _Array, h_true: _Array = None,
+                         w_opt: _Array = None) -> Dict[str, Any]:
+    """Analyze convergence behavior for ensemble data"""
+    # For ensemble mode, we always have ensemble data
+    mse_curve = jnp.mean(jnp.abs(e_hist)**2, axis=0)
+    coeff_error_wiener = jnp.mean(jnp.linalg.norm(w_hist - w_opt, axis=2), axis=0)
+    
+    # Find convergence iterations
+    conv_iter_10dB = find_convergence_iteration(mse_curve, -10)
+    conv_iter_20dB = find_convergence_iteration(mse_curve, -20)
+    conv_iter_30dB = find_convergence_iteration(mse_curve, -30)
+
+    convergence_metrics = {
+        "convergence_10dB_iter": conv_iter_10dB,
+        "convergence_20dB_iter": conv_iter_20dB,
+        "convergence_30dB_iter": conv_iter_30dB,
+        "final_coeff_error_wiener": jnp.mean(coeff_error_wiener[-100:]),
+        "coeff_error_wiener_curve": coeff_error_wiener,
+    }
+
+    # Add true coefficient error if h_true is available
+    if h_true is not None:
+        if h_true.ndim == 1:  # Stationary system
+            coeff_error_true = jnp.mean(jnp.linalg.norm(w_hist - h_true, axis=2), axis=0)
+        else:  # Time-varying system
+            # For ensemble analysis with time-varying h_true, we need to handle this case
+            # This assumes h_true is the same for all ensemble members (first one)
+            coeff_error_true = jnp.mean(jnp.linalg.norm(w_hist - h_true, axis=2), axis=0)
+        
+        convergence_metrics.update({
+            "final_coeff_error_true": jnp.mean(coeff_error_true[-100:]),
+            "coeff_error_true_curve": coeff_error_true,
+        })
+
+    return convergence_metrics
+  
+  def timeavg_wiener_solution(self, x: _Array, d: _Array) -> Tuple[_Array, _Array, _Array]:
     """Default Wiener solution implementation using time averages"""
     N_coef = self.lms.filter_order + 1  # Number of coefficients
     N = len(x)
@@ -377,37 +589,48 @@ class AdaptiveProblem(ABC):
 
     return w_opt, R, p
 
+  def ensemble_wiener_solution(self, all_x: _Array, all_d: _Array) -> Tuple[_Array, _Array, _Array]:
+    """Compute Wiener solution using ensemble averages"""
+    n_ensemble, n_samples = all_x.shape
+    N_coef = self.lms.filter_order + 1
+
+    # Ensemble average of autocorrelation matrix
+    R_ensemble = jnp.zeros((N_coef, N_coef), dtype=all_x.dtype)
+    for i in range(N_coef):
+        for j in range(i, N_coef):
+            lag = abs(i - j)
+            # Average correlation across ensemble
+            corr_sum = 0.0
+            for k in range(n_ensemble):
+                corr_sum += jnp.mean(jnp.conj(all_x[k, lag:]) * all_x[k, :n_samples - lag])
+            R_ensemble = R_ensemble.at[i, j].set(corr_sum / n_ensemble)
+            if i != j:
+                R_ensemble = R_ensemble.at[j, i].set(jnp.conj(corr_sum / n_ensemble))
+
+    # Ensemble average of cross-correlation vector
+    p_ensemble = jnp.zeros(N_coef, dtype=all_x.dtype)
+    for i in range(N_coef):
+        corr_sum = 0.0
+        for k in range(n_ensemble):
+            corr_sum += jnp.mean(jnp.conj(all_d[k, i:]) * all_x[k, :n_samples - i])
+        p_ensemble = p_ensemble.at[i].set(corr_sum / n_ensemble)
+
+    # Add regularization and solve
+    R_reg = R_ensemble + 1e-8 * jnp.eye(N_coef, dtype=all_x.dtype)
+    w_ensemble = jnp.linalg.solve(R_reg, p_ensemble)
+
+    return w_ensemble, R_ensemble, p_ensemble
+  
   def wiener_solution(self, x: _Array, d: _Array) -> Tuple[_Array, _Array, _Array]:
-    """Compute Wiener solution using provided function or default implementation"""
+    """Compute Wiener solution using appropriate method"""
     if self.wiener_sol_fn is not None:
-      return self.wiener_sol_fn(x, d, self.lms.filter_order)
+        return self.wiener_sol_fn(x, d, self.lms.filter_order)
+    elif hasattr(x, 'shape') and len(x.shape) > 1:
+        # If we have ensemble data, use ensemble Wiener solution
+        return self.ensemble_wiener_solution(x, d)
     else:
-      return self.default_wiener_solution(x, d)
-
-  def compute_basic_metrics(self, w_hist: _Array, e_hist: _Array, x: _Array,
-                            d: _Array) -> Dict[str, Any]:
-    """Compute basic performance metrics common to all adaptive problems"""
-    w_opt, R, p = self.wiener_solution(x, d)
-
-    mse_curve = jnp.abs(e_hist)**2
-    coeff_error = jnp.linalg.norm(w_hist - w_opt, axis=1)
-
-    return {
-        "wiener_solution": w_opt,
-        "R": R,
-        "p": p,
-        "final_coeff": w_hist[-1],
-        "final_mse": jnp.mean(mse_curve[-100:]),
-        "final_coeff_error": jnp.mean(coeff_error[-100:]),
-        "mse_curve": mse_curve,
-        "coeff_error_curve": coeff_error,
-    }
-
-  @abstractmethod
-  def analyze_performance(self, w_hist: _Array, e_hist: _Array, x: _Array,
-                          d: _Array) -> Dict[str, Any]:
-    """Analyze problem-specific performance metrics"""
-    pass
+        # Default to time average for single realization
+        return self.timeavg_wiener_solution(x, d)
 
   def get_problem_type(self) -> str:
     """Return the type of adaptive problem"""
@@ -416,841 +639,671 @@ class AdaptiveProblem(ABC):
   def step_size(self):
     return self.lms.mu
 
-
-# --------------------------------------------------
-# Channel Equalization Problem
-# --------------------------------------------------
 class ChannelEqualization(AdaptiveProblem):
+  def _add_problem_specific_metrics(self, ensemble_metrics: Dict, ensemble_data: Dict) -> Dict[str, Any]:
+    ensemble_metrics["problem_type"] = "channel_equalization"
+    return ensemble_metrics
 
-  def __init__(self, lms: LMS, gen_signals_fn, wiener_sol_fn=None, seed: int = 42):
-    super().__init__(lms, gen_signals_fn, wiener_sol_fn, seed)
-
-  def run(self, n_samples: int, training: bool = True):
-    """Run channel equalization experiment"""
-    x, d = self.generate_signals(n_samples)
-
-    # Run LMS adaptation
-    y_hist, e_hist, w_hist = self.run_adaptation(x, d, training)
-
-    # Analyze performance
-    metrics = self.analyze_performance(w_hist, e_hist, x, d)
-    return w_hist, e_hist, metrics
-
-  def analyze_performance(self, w_hist, e_hist, x, d):
-    return self.compute_basic_metrics(w_hist, e_hist, x, d)
-
-
-# ---------------------------------------------------------
-# Enhanced System Identification Problem with Spread Control
-# ----------------------------------------------------------
 class SystemIdentification(AdaptiveProblem):
+  def _add_problem_specific_metrics(self, ensemble_metrics: Dict, ensemble_data: Dict) -> Dict[str, Any]:
+    ensemble_metrics["problem_type"] = "system_identification"
+    return ensemble_metrics
 
-  def __init__(self,
-               lms: Any,
-               gen_signals_fn: Callable,
-               wiener_sol_fn: Optional[Callable] = None,
-               seed: int = 42):
-    """
-      System Identification Problem
-      
-      Args:
-          lms: LMS filter instance
-          gen_signals_fn: Function that returns (unknown_system_taps, x, d)
-                        This function should handle any spread control internally
-          wiener_sol_fn: Function to compute Wiener solution (optional)
-          seed: Random seed
-      """
-    super().__init__(lms, gen_signals_fn, wiener_sol_fn, seed)
+def _generate_summary_text(metrics: Dict[str, Any], n_iters: int, 
+                          problem_type: str, n_ensemble: int) -> List[str]:
+    """Generate comprehensive summary text for the plot"""
+    summary_text = []
 
-  def run(self, n_samples: int, training: bool = True, **kwargs):
-    """Run system identification experiment"""
-    # Generate unknown system and signals
-    # Pass any additional kwargs to the signal generator
-    unknown_system, x, d, measured_noise = self.generate_signals(n_samples, **kwargs)
+    summary_text.append(f"Problem Type: {problem_type.replace('_', ' ').title()}")
+    summary_text.append(f"Iterations: {n_iters}")
+    summary_text.append(f"Ensemble Size: {n_ensemble}")
+    summary_text.append("-" * 40)
 
-    # Run LMS adaptation
-    y_hist, e_hist, w_hist = self.run_adaptation(x, d, training)
+    # Basic metrics - use ensemble metrics
+    if 'final_mse' in metrics:
+        summary_text.append(f"Final MSE: {metrics['final_mse']:.2e}")
+    if 'min_mse' in metrics:
+        summary_text.append(f"Minimum MSE: {metrics['min_mse']:.2e}")
 
-    # Analyze performance
-    metrics = self.analyze_performance(w_hist, e_hist, x, d, unknown_system, measured_noise)
+    # Misadjustment
+    if 'misadjustment' in metrics and 'misadjustment_theoretical' in metrics:
+        summary_text.append(f"Misadjustment: {metrics['misadjustment']:.4f} (Exp)")
+        summary_text.append(f"Misadjustment: {metrics['misadjustment_theoretical']:.4f} (Theo)")
 
-    return w_hist, e_hist, metrics, unknown_system
+    # Problem-specific metrics
+    summary_text.append("-" * 40)
+    if problem_type == 'time_varying_system_identification':
+        summary_text.append("TIME-VARYING SYSTEM:")
+        if 'final_coeff_tracking_error' in metrics:
+            summary_text.append(f"Tracking Error: {metrics['final_coeff_tracking_error']:.4f}")
+            
+    elif problem_type == 'channel_equalization':
+        summary_text.append("CHANNEL EQUALIZATION:")
+        # Remove metrics that don't exist in ensemble mode
+        summary_text.append("Equalizer Performance:")
 
-  def analyze_performance(self, w_hist: _Array, e_hist: _Array, x: _Array, d: _Array,
-                          h_true: _Array, measured_noise: _Array) -> Dict[str, Any]:
-    """Fixed version with reliable min MSE calculation"""
+    # Convergence metrics - use ensemble metrics
+    summary_text.append("-" * 40)
+    if 'final_coeff_error_true' in metrics:
+        summary_text.append(f"Coeff Error (True): {metrics['final_coeff_error_true']:.2e}")
+    if 'final_coeff_error' in metrics:  # This is Wiener error in ensemble mode
+        summary_text.append(f"Coeff Error (Wiener): {metrics['final_coeff_error']:.2e}")
 
-    # Get basic metrics
-    metrics = self.compute_basic_metrics(w_hist, e_hist, x, d)
-
-    # Use KNOWN noise variance instead of measured (more reliable)
-    min_mse_reliable = jnp.mean(jnp.abs(measured_noise)**2)
-
-    # System identification specific metrics
-    coeff_error_true = jnp.linalg.norm(w_hist - h_true, axis=1)
-
-    # Compute theoretical parameters
-    R = metrics["R"]
-    eigenvals = jnp.linalg.eigvals(R)
-    max_eigenval = jnp.max(jnp.real(eigenvals))
-    min_eigenval = jnp.min(jnp.real(eigenvals))
-    trace_R = jnp.trace(R)
-
-    # MSE calculations
-    mse_curve = jnp.abs(e_hist)**2
-
-    # Use only steady-state for final calculations
-    steady_state_start = len(mse_curve) // 2
-    if 'convergence_20dB_iter' in metrics:
-      steady_state_start = metrics['convergence_20dB_iter']
-
-    mse_steady = mse_curve[steady_state_start:]
-    final_mse = jnp.mean(mse_steady[-100:])
-    mean_mse_steady = jnp.mean(mse_steady)
-
-    # Misadjustment calculations
-    misadjustment_curve = (mse_curve - min_mse_reliable) / min_mse_reliable
-    final_misadjustment = (final_mse - min_mse_reliable) / min_mse_reliable
-    misadjustment_avg = (mean_mse_steady - min_mse_reliable) / min_mse_reliable
-
-    # Theoretical
-    mu = self.step_size()
-    theoretical_misadjustment = (mu * trace_R) / (1 - mu * trace_R)
-
-    # Convergence analysis
-    convergence_metrics = self.analyze_convergence(e_hist, w_hist, h_true,
-                                                   metrics["wiener_solution"])
-
-    # Print diagnostic information
-    print(f"\n=== PERFORMANCE DIAGNOSTICS ===")
-    print(f"Min MSE (σₙ²): {min_mse_reliable:.6f}")
-    print(f"Final MSE: {final_mse:.6f}")
-    print(f"Mean MSE (steady): {mean_mse_steady:.6f}")
-    print(f"Final Misadjustment: {final_misadjustment:.6f}")
-    print(f"Theoretical Misadjustment: {theoretical_misadjustment:.6f}")
-    print(f"Steady-state start: {steady_state_start}")
-    print("=" * 40)
-
-    metrics.update({
-        "unknown_system": h_true,
-        "mean_mse": mean_mse_steady,
-        "min_mse": min_mse_reliable,
-        "misadjustment_curve": misadjustment_curve,
-        "misadjustment": misadjustment_avg,  # Use steady-state average
-        "misadjustment_theoretical": theoretical_misadjustment,
-        "final_misadjustment": final_misadjustment,
-        "final_coeff_error_true": jnp.mean(coeff_error_true[-100:]),
-        "coeff_error_true_curve": coeff_error_true,
-        "eigenvalues": eigenvals,
-        "max_eigenvalue": max_eigenval,
-        "min_eigenvalue": min_eigenval,
-        "trace_R": trace_R,
-        "problem_type": "system_identification",
-        **convergence_metrics
-    })
-
-    return metrics
-  
-  def analyze_convergence(self, e_hist: _Array, w_hist: _Array, h_true: _Array,
-                          w_opt: _Array) -> Dict[str, Any]:
-    """Analyze convergence behavior for system identification"""
-    mse_curve = jnp.abs(e_hist)**2
-
-    # Algorithm performance: how close to Wiener solution
-    coeff_error_wiener = jnp.linalg.norm(w_hist - w_opt, axis=1)
-
-    # Identification accuracy: how close to true system
-    coeff_error_true = jnp.linalg.norm(w_hist - h_true, axis=1)
-
-    # Find convergence iterations
-    conv_iter_10dB = find_convergence_iteration(mse_curve, -10)
-    conv_iter_20dB = find_convergence_iteration(mse_curve, -20)
-    conv_iter_30dB = find_convergence_iteration(mse_curve, -30)
-
-    return {
-        "convergence_10dB_iter": conv_iter_10dB,
-        "convergence_20dB_iter": conv_iter_20dB,
-        "convergence_30dB_iter": conv_iter_30dB,
-        "final_coeff_error_wiener": jnp.mean(coeff_error_wiener[-100:]),
-        "final_coeff_error_true": jnp.mean(coeff_error_true[-100:]),
-        "coeff_error_wiener_curve": coeff_error_wiener,
-        "coeff_error_true_curve": coeff_error_true,
-    }
-
-class TimeVaryingSystemIdentification(SystemIdentification):
-  """Extended for time-varying system analysis"""
-
-  def __init__(
-      self,
-      lms: Any,
-      gen_signals_fn: Callable,
-      wiener_sol_fn: Optional[Callable] = None,
-      sigma_w2: float = 0.0015,  # Default from problem 3.6.2(e)
-      sigma_n2: float = 0.01,  # Default from problem 3.6.2(e)  
-      seed: int = 42):
-    """
-        Time-Varying System Identification Problem
+    # System parameters
+    summary_text.append("-" * 40)
+    if 'max_eigenvalue' in metrics and 'min_eigenvalue' in metrics:
+        spread = metrics['max_eigenvalue'] / metrics['min_eigenvalue']
+        summary_text.append(f"Eigenvalue Spread: {spread:.2f}")
+    if 'trace_R' in metrics:
+        summary_text.append(f"Trace(R): {metrics['trace_R']:.4f}")
         
-        Args:
-            lms: LMS filter instance
-            gen_signals_fn: Function that returns (unknown_system_taps, x, d, measured_noise)
-            wiener_sol_fn: Function to compute Wiener solution (optional)
-            sigma_w2: Variance of coefficient innovations
-            sigma_n2: Measurement noise variance
-            seed: Random seed
-        """
-    super().__init__(lms, gen_signals_fn, wiener_sol_fn, seed)
-    self.sigma_w2 = sigma_w2
-    self.sigma_n2 = sigma_n2
-  
-  def analyze_performance(self, w_hist: _Array, e_hist: _Array, x: _Array, d: _Array,
-                          h_true_time_varying: _Array, measured_noise: _Array) -> Dict[str, Any]:
-    """Analyze performance for time-varying system with complete metrics"""
+    # Step size info
+    mu = metrics.get('step_size', 'N/A')
+    summary_text.append(f"Step Size μ: {mu}")
 
-    # Get basic metrics from parent class
-    metrics = super().analyze_performance(w_hist, e_hist, x, d, h_true_time_varying, measured_noise)
-
-    # Time-varying specific metrics
-    n_iters = len(e_hist)
-    n_coeffs = w_hist.shape[1]
-
-    # Calculate lag error vector: l_w(k) = w(k) - w_o(k)
-    l_w = w_hist - h_true_time_varying[:n_iters + 1]
-
-    # Get R matrix (computed in parent class)
-    R = metrics["R"]
-    trace_R = metrics["trace_R"]
-
-    # Calculate lag-induced excess MSE
-    lag_excess_mse = self.calculate_lag_excess_mse(l_w, R)
-
-    # Theoretical calculations
-    mu = self.step_size()
-
-    # 1. Gradient noise component (stationary case misadjustment)
-    misadjustment_gradient = (mu * trace_R) / (1 - mu * trace_R)
-    excess_mse_gradient = misadjustment_gradient * self.sigma_n2
-
-    # 2. Tracking lag components
-    # Simplified theoretical approximation
-    theoretical_lag_excess_mse_simple = (self.sigma_w2 / (4 * mu)) * n_coeffs
-
-    # More accurate theoretical calculation from equation (3.69)
-    eigenvals = jnp.linalg.eigvals(R)
-    theoretical_lag_excess_mse_accurate = 0.0
-    for i in range(n_coeffs):
-      lambda_i = jnp.real(eigenvals[i])
-      theoretical_lag_excess_mse_accurate += self.sigma_w2 / (4 * mu * (1 - mu * lambda_i))
-
-    # 3. Total theoretical excess MSE
-    total_theoretical_excess_mse = excess_mse_gradient + theoretical_lag_excess_mse_accurate
-    total_theoretical_mse = self.sigma_n2 + total_theoretical_excess_mse
-
-    # 4. Experimental excess MSE calculations
-    mse_curve = jnp.abs(e_hist)**2
-    final_mse = metrics["final_mse"]
-    experimental_excess_mse = final_mse - self.sigma_n2
-
-    # 5. Coefficient tracking performance
-    coeff_tracking_error = jnp.linalg.norm(l_w, axis=1)
-    final_coeff_tracking_error = jnp.mean(coeff_tracking_error[-100:])
-
-    # 6. Calculate optimal μ for comparison
-    mu_opt = self.calculate_optimal_mu(n_coeffs, trace_R)
-
-    # Update metrics with time-varying specific results
-    metrics.update({
-        "h_true_time_varying": h_true_time_varying,
-        "l_w": l_w,  # Lag error vector history
-
-        # Lag excess MSE calculations
-        "lag_excess_mse_experimental": lag_excess_mse,
-        "lag_excess_mse_theoretical_simple": theoretical_lag_excess_mse_simple,
-        "lag_excess_mse_theoretical_accurate": theoretical_lag_excess_mse_accurate,
-
-        # Gradient noise components
-        "misadjustment_gradient_theoretical": misadjustment_gradient,
-        "excess_mse_gradient_theoretical": excess_mse_gradient,
-
-        # Total excess MSE
-        "excess_mse_experimental": experimental_excess_mse,
-        "excess_mse_theoretical": total_theoretical_excess_mse,
-        "total_mse_theoretical": total_theoretical_mse,
-
-        # Tracking performance
-        "coeff_tracking_error_curve": coeff_tracking_error,
-        "final_coeff_tracking_error": final_coeff_tracking_error,
-
-        # Optimal μ analysis
-        "mu_opt": mu_opt,
-        "mu_used": mu,
-        "is_optimal_mu": jnp.abs(mu - mu_opt) < 0.001,
-
-        # Problem parameters
-        "sigma_w2": self.sigma_w2,
-        "sigma_n2": self.sigma_n2,
-        "problem_type": "time_varying_system_identification",
-    })
-
-    # Print comprehensive results
-    self._print_time_varying_analysis(metrics)
-
-    return metrics
-
-  def calculate_lag_excess_mse(self, l_w: _Array, R: _Array) -> float:
-    """
-        Calculate excess MSE due to tracking lag in nonstationary environments.
-        
-        From equation (3.69): ξ_lag = E[l_w^T(k) R l_w(k)]
-        """
-    # Calculate covariance of lag error
-    l_w_cov = jnp.cov(l_w.T)  # Shape (N, N)
-
-    # ξ_lag = trace(R * E[l_w l_w^T])
-    lag_excess_mse = jnp.trace(R @ l_w_cov)
-
-    return lag_excess_mse
-
-  def calculate_optimal_mu(self, n_coeffs: int, tr_R: float) -> float:
-    """
-        Calculate optimal step size μ for nonstationary environments.
-        
-        μ_opt = √[ (N) * σ_w² / (4 * σ_n² * tr[R]) ]
-        """
-    numerator = n_coeffs * self.sigma_w2
-    denominator = 4 * self.sigma_n2 * tr_R
-    return jnp.sqrt(numerator / denominator)
-
-  def print_time_varying_analysis(self, metrics: Dict[str, Any]):
-    """Print comprehensive time-varying analysis results"""
-
-    print(f"\n{'='*80}")
-    print("TIME-VARYING SYSTEM IDENTIFICATION ANALYSIS")
-    print(f"{'='*80}")
-
-    print(f"\nParameters:")
-    print(f"  Step size μ: {metrics['mu_used']:.6f}")
-    print(f"  Optimal μ:   {metrics['mu_opt']:.6f}")
-    print(f"  Using optimal μ: {metrics['is_optimal_mu']}")
-    print(f"  σ_w²: {self.sigma_w2:.6f} (coefficient innovation)")
-    print(f"  σ_n²: {self.sigma_n2:.6f} (measurement noise)")
-    print(f"  Filter coefficients: {metrics['w_hist'].shape[1]}")
-
-    print(f"\nPerformance Results:")
-    print(f"  Final MSE: {metrics['final_mse']:.6f}")
-    print(f"  Theoretical MSE: {metrics['total_mse_theoretical']:.6f}")
-
-    print(f"\nExcess MSE Breakdown:")
-    print(f"  Total Experimental: {metrics['excess_mse_experimental']:.6f}")
-    print(f"  Total Theoretical:  {metrics['excess_mse_theoretical']:.6f}")
-
-    print(f"\n  Experimental Components:")
-    print(
-        f"    - Gradient Noise: {metrics['excess_mse_experimental'] - metrics['lag_excess_mse_experimental']:.6f}"
-    )
-    print(f"    - Tracking Lag:   {metrics['lag_excess_mse_experimental']:.6f}")
-
-    print(f"\n  Theoretical Components:")
-    print(f"    - Gradient Noise: {metrics['excess_mse_gradient_theoretical']:.6f}")
-    print(f"    - Tracking Lag:   {metrics['lag_excess_mse_theoretical_accurate']:.6f}")
-
-    print(f"\nTracking Performance:")
-    print(f"  Final Coefficient Error: {metrics['final_coeff_tracking_error']:.6f}")
-
-    # Calculate agreement percentages
-    total_agreement = 1 - abs(metrics['excess_mse_experimental'] -
-                              metrics['excess_mse_theoretical']) / metrics['excess_mse_theoretical']
-    lag_agreement = 1 - abs(metrics['lag_excess_mse_experimental'] -
-                            metrics['lag_excess_mse_theoretical_accurate']
-                           ) / metrics['lag_excess_mse_theoretical_accurate']
-
-    print(f"\nAgreement with Theory:")
-    print(f"  Total Excess MSE: {total_agreement:.2%}")
-    print(f"  Lag Component:    {lag_agreement:.2%}")
-
-    if total_agreement > 0.8:
-      print("  ✓ Good agreement with theoretical predictions")
-    elif total_agreement > 0.6:
-      print("  ~ Reasonable agreement with theoretical predictions")
-    else:
-      print("  ✗ Poor agreement with theoretical predictions")
-
+    return summary_text
 
 def plot_results(w_hist: _Array, e_hist: _Array, metrics: Dict[str, Any]):
-  """
-    Plot comprehensive system identification results with new metrics and 
-    return the matplotlib Figure object.
     """
+    Plot comprehensive adaptive filtering results for ensemble-only mode
+    """
+    # Handle ensemble data shape: (n_ensemble, n_samples) for e_hist
+    if e_hist.ndim == 2:  # Ensemble data
+        n_ensemble, n_iters = e_hist.shape
+        # Use first ensemble member for single trajectory plots
+        e_hist_single = e_hist[0] if n_ensemble > 0 else e_hist
+        w_hist_single = w_hist[0] if n_ensemble > 0 else w_hist
+    else:  # Single realization (fallback)
+        n_iters = len(e_hist)
+        n_ensemble = 1
+        e_hist_single = e_hist
+        w_hist_single = w_hist
+    
+    n_coeffs = w_hist_single.shape[1] if w_hist_single.ndim > 1 else 1
+    
+    # Determine problem type
+    problem_type = metrics.get('problem_type', 'unknown')
+    n_ensemble = metrics.get('n_ensemble', n_ensemble)
+    
+    # Create figure layout
+    fig = plt.figure(figsize=(18, 20))
+    gs = gridspec.GridSpec(5, 3, figure=fig)
 
-  n_iters = len(e_hist)
-  n_coeffs = w_hist.shape[1]
+    # Plot 1: Learning curve (MSE) - Ensemble Average
+    ax1 = fig.add_subplot(gs[0, 0])
+    
+    # Use ensemble average MSE curve
+    if 'avg_mse_curve' in metrics:
+        mse_curve = metrics['avg_mse_curve']
+    else:
+        # Fallback: average across ensemble
+        mse_curve = jnp.mean(jnp.abs(e_hist)**2, axis=0)
+    
+    mse_curve_np = np.asarray(mse_curve)
 
-  # Create figure with more subplots
-  fig = plt.figure(figsize=(18, 20))  # Increased height for new plot
-  gs = gridspec.GridSpec(5, 3, figure=fig)  # Changed to 5 rows
+    ax1.semilogy(mse_curve_np, 'b-', alpha=0.7, linewidth=1, label='Ensemble Average')
 
-  # Plot 1: Learning curve (MSE)
-  ax1 = fig.add_subplot(gs[0, 0])
-  # Use .get with a default for robust access
-  mse_curve = metrics.get('mse_curve', jnp.abs(e_hist)**2)
-  # Ensure mse_curve is a numpy array for plotting if it was a jnp array
-  mse_curve_np = np.asarray(mse_curve)
+    # Mark convergence points
+    convergence_colors = {
+        'convergence_10dB_iter': 'r',
+        'convergence_20dB_iter': 'g', 
+        'convergence_30dB_iter': 'm'
+    }
+    for conv_key, color in convergence_colors.items():
+        if conv_key in metrics and metrics[conv_key] is not None:
+            ax1.axvline(x=metrics[conv_key], color=color, linestyle='--', 
+                        alpha=0.7, label=f'{conv_key.split("_")[1]}dB')
 
-  ax1.semilogy(mse_curve_np, 'b-', alpha=0.7, linewidth=1)
+    ax1.set_ylabel('MSE')
+    ax1.set_xlabel('Iteration')
+    ax1.set_title(f'(a) Learning Curve ({problem_type.replace("_", " ").title()})')
+    ax1.grid(True, alpha=0.3)
+    if any(key in metrics for key in convergence_colors.keys()):
+        ax1.legend()
 
-  # Mark convergence points if available
-  if 'convergence_10dB_iter' in metrics:
-    ax1.axvline(x=metrics['convergence_10dB_iter'],
-                color='r',
-                linestyle='--',
-                alpha=0.7,
-                label='-10dB')
-  if 'convergence_20dB_iter' in metrics:
-    ax1.axvline(x=metrics['convergence_20dB_iter'],
-                color='g',
-                linestyle='--',
-                alpha=0.7,
-                label='-20dB')
-  if 'convergence_30dB_iter' in metrics:
-    ax1.axvline(x=metrics['convergence_30dB_iter'],
-                color='m',
-                linestyle='--',
-                alpha=0.7,
-                label='-30dB')
+    # Plot 2: Misadjustment Learning Curve
+    ax2 = fig.add_subplot(gs[0, 1])
+    if 'misadjustment_curve' in metrics:
+        misadjustment_curve = np.asarray(metrics['misadjustment_curve'])
+        ax2.plot(misadjustment_curve, 'g-', alpha=0.7, linewidth=1, label='Empirical Misadjustment')
 
-  ax1.set_ylabel('MSE')
-  ax1.set_xlabel('Iteration')
-  ax1.set_title('(a) Learning Curve with Convergence Points')
-  ax1.grid(True, alpha=0.3)
-  if any(key in metrics
-         for key in [ 'convergence_10dB_iter', 'convergence_20dB_iter', 'convergence_30dB_iter']):
-    ax1.legend()
+        if 'misadjustment_theoretical' in metrics:
+            theoretical_m = metrics['misadjustment_theoretical']
+            ax2.axhline(y=theoretical_m, color='r', linestyle='--', linewidth=2,
+                       label=f'Theoretical M = {theoretical_m:.3f}')
 
-  # Plot 2: Misadjustment Learning Curve (NEW PLOT)
-  ax2 = fig.add_subplot(gs[0, 1])
-  if 'misadjustment_curve' in metrics:
-    misadjustment_curve = np.asarray(metrics['misadjustment_curve'])
-    ax2.plot(misadjustment_curve, 'g-', alpha=0.7, linewidth=1, label='Empirical Misadjustment')
+        if 'misadjustment' in metrics:
+            final_m = metrics['misadjustment']
+            ax2.axhline(y=final_m, color='b', linestyle=':', linewidth=2,
+                       label=f'Final M = {final_m:.3f}')
 
-    # Plot theoretical misadjustment line if available
-    if 'misadjustment_theoretical' in metrics:
-      theoretical_m = metrics['misadjustment_theoretical']
-      ax2.axhline(y=theoretical_m,
-                  color='r',
-                  linestyle='--',
-                  linewidth=2,
-                  label=f'Theoretical M = {theoretical_m:.3f}')
+        ax2.set_ylabel('Misadjustment M(k)')
+        ax2.set_xlabel('Iteration')
+        ax2.set_title('(b) Misadjustment Learning Curve')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+    else:
+        ax2.text(0.5, 0.5, 'No misadjustment curve data', 
+                ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title('(b) Misadjustment Learning Curve')
+        ax2.grid(True, alpha=0.3)
 
-    # Plot final steady-state misadjustment if available
-    if 'misadjustment' in metrics:
-      final_m = metrics['misadjustment']
-      ax2.axhline(y=final_m,
-                  color='b',
-                  linestyle=':',
-                  linewidth=2,
-                  label=f'Final M = {final_m:.3f}')
+    # Plot 3: Coefficient convergence - Show first ensemble member
+    ax3 = fig.add_subplot(gs[0, 2])
+    
+    if problem_type == 'time_varying_system_identification' and 'h_true_ensemble' in metrics:
+        # Time-varying coefficient tracking
+        h_true_tv = metrics['h_true_ensemble'][0]  # First ensemble member
+        for i in range(min(3, n_coeffs)):
+            ax3.plot(w_hist_single[:, i], label=f'w[{i}]', alpha=0.7, linewidth=1)
+            if i < h_true_tv.shape[1]:
+                ax3.plot(h_true_tv[:n_iters, i], '--', label=f'h_true[{i}]', alpha=0.8, linewidth=1.5)
+        ax3.set_title('(c) Time-Varying Coefficient Tracking')
+        
+    elif problem_type == 'channel_equalization':
+        # Equalizer coefficients - first ensemble member
+        for i in range(min(4, n_coeffs)):
+            ax3.plot(w_hist_single[:, i], label=f'w[{i}]', alpha=0.7)
+        if 'wiener_solution' in metrics:
+            w_opt = metrics['wiener_solution']
+            for i in range(min(4, len(w_opt))):
+                ax3.axhline(y=w_opt[i], color=f'C{i}', linestyle='--', 
+                           linewidth=2, label=f'w_opt[{i}]', alpha=0.8)
+        ax3.set_title('(c) Equalizer Coefficients')
+        
+    elif 'unknown_system' in metrics:
+        # Stationary system identification - first ensemble member
+        h_true = metrics['unknown_system']
+        for i in range(min(4, n_coeffs)):
+            ax3.plot(w_hist_single[:, i], label=f'w[{i}]', alpha=0.7)
+            if i < len(h_true):
+                ax3.axhline(y=h_true[i], color=f'C{i}', linestyle='--', 
+                           linewidth=2, label=f'h_true[{i}]', alpha=0.8)
+        ax3.set_title('(c) Coefficient Convergence vs True System')
+    else:
+        # Generic coefficient plot
+        for i in range(min(4, n_coeffs)):
+            ax3.plot(w_hist_single[:, i], label=f'w[{i}]', alpha=0.7)
+        ax3.set_title('(c) Coefficient Convergence')
 
-    ax2.set_ylabel('Misadjustment M(k)')
-    ax2.set_xlabel('Iteration')
-    ax2.set_title('(b) Misadjustment Learning Curve')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-  else:
-    ax2.text(0.5,
-             0.5,
-             'No misadjustment curve data',
-             ha='center',
-             va='center',
-             transform=ax2.transAxes)
-    ax2.set_title('(b) Misadjustment Learning Curve')
-    ax2.grid(True, alpha=0.3)
+    ax3.set_ylabel('Coefficient Value')
+    ax3.set_xlabel('Iteration')
+    ax3.legend(ncol=2, fontsize=8)
+    ax3.grid(True, alpha=0.3)
 
-  # Plot 3: Coefficient convergence vs TRUE system
-  ax3 = fig.add_subplot(gs[0, 2])
-  if 'unknown_system' in metrics:
-    h_true = metrics['unknown_system']
-    for i in range(min(4, n_coeffs)):
-      # Plot real part of coefficients
-      ax3.plot(jnp.real(w_hist[:, i]), label=f'Re(w[{i}])', alpha=0.7)
-      # Plot real part of true system
-      ax3.axhline(y=jnp.real(h_true[i]),
-                  color=f'C{i}',
-                  linestyle='--',
-                  linewidth=2,
-                  label=f'Re(h_true[{i}])',
-                  alpha=0.8)
-  else:
-    for i in range(min(4, n_coeffs)):
-      ax3.plot(jnp.real(w_hist[:, i]), label=f'Re(w[{i}])', alpha=0.7)
+    # Plot 4: Coefficient error comparison - Ensemble averages
+    ax4 = fig.add_subplot(gs[1, 0])
+    error_curves = []
+    error_labels = []
 
-  ax3.set_ylabel('Coefficient Value')
-  ax3.set_xlabel('Iteration')
-  ax3.set_title('(c) Coefficient Convergence vs True System (Real)')
-  ax3.legend(ncol=2, fontsize=8)
-  ax3.grid(True, alpha=0.3)
+    # Use ensemble average error curves
+    if 'avg_coeff_error_curve' in metrics:
+        error_curves.append(metrics['avg_coeff_error_curve'])
+        error_labels.append('Ensemble Avg Error vs Wiener')
 
-  # Plot 4: Dual coefficient errors (Wiener vs True)
-  ax4 = fig.add_subplot(gs[1, 0])
-  if 'coeff_error_curve' in metrics and 'coeff_error_true_curve' in metrics:
-    ax4.semilogy(metrics['coeff_error_curve'], 'r-', label='Error vs Wiener', alpha=0.7)
-    ax4.semilogy(metrics['coeff_error_true_curve'], 'b-', label='Error vs True', alpha=0.7)
+    if 'avg_coeff_error_true_curve' in metrics:
+        error_curves.append(metrics['avg_coeff_error_true_curve'])
+        error_labels.append('Ensemble Avg Error vs True')
+
+    if problem_type == 'time_varying_system_identification' and 'coeff_tracking_error_curve' in metrics:
+        error_curves.append(metrics['coeff_tracking_error_curve'])
+        error_labels.append('Tracking Error')
+
+    for curve, label in zip(error_curves, error_labels):
+        ax4.semilogy(curve, label=label, alpha=0.7)
+
     ax4.set_ylabel('Coefficient Error Norm')
-    ax4.legend()
-  elif 'coeff_error_curve' in metrics:
-    ax4.semilogy(metrics['coeff_error_curve'], 'r-', label='Error vs Wiener')
-    ax4.set_ylabel('Coefficient Error Norm')
-  ax4.set_xlabel('Iteration')
-  ax4.set_title('(d) Coefficient Error Comparison')
-  ax4.grid(True, alpha=0.3)
+    ax4.set_xlabel('Iteration')
+    ax4.set_title('(d) Coefficient Error Comparison')
+    if error_curves:
+        ax4.legend()
+    ax4.grid(True, alpha=0.3)
 
-  # Plot 5: Eigenvalue analysis
-  ax5 = fig.add_subplot(gs[1, 1])
-  if 'eigenvalues' in metrics:
-    # Use real part for plotting magnitude in stem plot context
-    eigenvals = np.abs(metrics['eigenvalues'])
-    ax5.stem(np.real(eigenvals), basefmt=" ")
-    ax5.set_ylabel('Eigenvalue Magnitude')
-    ax5.set_xlabel('Eigenvalue Index')
+    # Plot 5: Eigenvalue analysis
+    ax5 = fig.add_subplot(gs[1, 1])
+    if 'eigenvalues' in metrics:
+        eigenvals = np.abs(metrics['eigenvalues'])
+        ax5.stem(np.real(eigenvals), basefmt=" ")
+        ax5.set_ylabel('Eigenvalue Magnitude')
+        ax5.set_xlabel('Eigenvalue Index')
 
-    # Add eigenvalue spread info
-    max_e = np.max(eigenvals)
-    min_e = np.min(eigenvals)
-    # Handle the case of min_e being zero or near zero to avoid division by zero
-    spread = max_e / min_e if min_e > 1e-10 else np.inf
-    spread_str = f"Spread: {spread:.2f}" if spread != np.inf else "Spread: Inf"
+        max_e = np.max(eigenvals)
+        min_e = np.min(eigenvals)
+        spread = max_e / min_e if min_e > 1e-10 else np.inf
+        spread_str = f"Spread: {spread:.2f}" if spread != np.inf else "Spread: Inf"
 
-    ax5.set_title(f'(e) Eigenvalue Distribution\n{spread_str}')
-  else:
-    ax5.text(0.5, 0.5, 'No eigenvalue data', ha='center', va='center', transform=ax5.transAxes)
-    ax5.set_title('(e) Eigenvalue Distribution')
-  ax5.grid(True, alpha=0.3)
+        ax5.set_title(f'(e) Eigenvalue Distribution\n{spread_str}')
+    else:
+        ax5.text(0.5, 0.5, 'No eigenvalue data', 
+                ha='center', va='center', transform=ax5.transAxes)
+        ax5.set_title('(e) Eigenvalue Distribution')
+    ax5.grid(True, alpha=0.3)
 
-  # Plot 6: Misadjustment and performance metrics (Bar chart)
-  ax6 = fig.add_subplot(gs[1, 2])
-  performance_data = []
-  performance_labels = []
+    # Plot 6: Performance metrics (Bar chart)
+    ax6 = fig.add_subplot(gs[1, 2])
+    performance_data = []
+    performance_labels = []
+    performance_colors = []
 
-  if 'misadjustment' in metrics:
-    performance_data.append(metrics['misadjustment'])
-    performance_labels.append('Final Misadjustment')
+    # Basic metrics for all problem types
+    metric_config = [
+        ('misadjustment', 'Final Misadjustment', 'skyblue'),
+        ('misadjustment_theoretical', 'Theoretical Misadjustment', 'lightcoral'),
+        ('final_mse', 'Final MSE', 'lightgreen'),
+        ('min_mse', 'Min MSE', 'lightyellow'),
+        ('final_coeff_error', 'Coeff Error (Wiener)', 'lightpink'),
+        ('final_coeff_error_true', 'Coeff Error (True)', 'lightcyan'),
+    ]
 
-  if 'misadjustment_theoretical' in metrics:
-    performance_data.append(metrics['misadjustment_theoretical'])
-    performance_labels.append('Theoretical Misadjustment')
+    # Problem-specific metrics
+    if problem_type == 'time_varying_system_identification':
+        metric_config.extend([
+            ('final_coeff_tracking_error', 'Tracking Error', 'brown'),
+        ])
 
-  if 'final_mse' in metrics:
-    performance_data.append(metrics['final_mse'])
-    performance_labels.append('Final MSE')
+    for key, label, color in metric_config:
+        if key in metrics and metrics[key] is not None:
+            performance_data.append(metrics[key])
+            performance_labels.append(label)
+            performance_colors.append(color)
 
-  if 'min_mse' in metrics:
-    performance_data.append(metrics['min_mse'])
-    performance_labels.append('Min MSE')
+    if performance_data:
+        bars = ax6.bar(range(len(performance_data)), performance_data, 
+                      color=performance_colors, width=0.4, edgecolor='black', linewidth=0.3)
+        ax6.set_xticks(range(len(performance_data)))
+        ax6.set_xticklabels(performance_labels, rotation=45, ha='right')
 
-  if performance_data:
-    bars = ax6.bar(range(len(performance_data)),
-                   performance_data,
-                   color=[ 'skyblue', 'lightcoral', 'lightgreen', 'lightyellow'],
-                   width=0.4,
-                   edgecolor='black',
-                   linewidth=0.3)
-    ax6.set_xticks(range(len(performance_data)))
-    ax6.set_xticklabels(performance_labels, rotation=45, ha='right')
+        for bar, value in zip(bars, performance_data):
+            ax6.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f'{value:.2e}', ha='center', va='bottom', fontsize=8)
 
-    # Add value labels on bars
-    for bar, value in zip(bars, performance_data):
-      ax6.text(bar.get_x() + bar.get_width() / 2,
-               bar.get_height(),
-               f'{value:.2e}',
-               ha='center',
-               va='bottom',
-               fontsize=9)
+        ax6.ticklabel_format(axis='y', style='sci', scilimits=(-2, 3))
 
-    ax6.ticklabel_format(axis='y', style='sci',
-                         scilimits=(-2, 3))  # Use scientific notation for Y-axis
+    ax6.set_ylabel('Value')
+    ax6.set_title('(f) Performance Metrics')
+    ax6.grid(True, alpha=0.3, axis='y')
 
-  ax6.set_ylabel('Value')
-  ax6.set_title('(f) Performance Metrics')
-  ax6.grid(True, alpha=0.3, axis='y')
+    # Plot 7: Configuration and Parameters
+    ax7 = fig.add_subplot(gs[2, 2])
+    config_info = []
+    
+    # Basic configuration
+    config_info.append(f"Problem: {problem_type}")
+    config_info.append(f"Filter order: {n_coeffs-1}")
+    config_info.append(f"Iterations: {n_iters}")
+    config_info.append(f"Ensemble size: {n_ensemble}")
+    
+    # Step size info
+    mu = metrics.get('step_size', 'N/A')
+    config_info.append(f"Step size μ: {mu}")
+    
+    # Eigenvalue info
+    if 'max_eigenvalue' in metrics and 'min_eigenvalue' in metrics:
+        spread = metrics['max_eigenvalue'] / metrics['min_eigenvalue']
+        config_info.append(f"Eigenvalue spread: {spread:.2f}")
+    
+    if 'trace_R' in metrics:
+        config_info.append(f"Trace(R): {metrics['trace_R']:.4f}")
 
-  # Plot 7: Spread control information
-  ax7 = fig.add_subplot(gs[2, 0])
-  spread_info = []
-  if 'target_eigenvalue_spread' in metrics:
-    spread_info.append(f"Target Spread: {metrics['target_eigenvalue_spread']:.1f}")
-  if 'actual_eigenvalue_spread' in metrics:
-    spread_info.append(f"Actual Spread: {metrics['actual_eigenvalue_spread']:.1f}")
-  if 'ar1_pole_used' in metrics:
-    spread_info.append(f"AR(1) Pole: {metrics['ar1_pole_used']:.3f}")
+    ax7.text(0.5, 0.7, '\n'.join(config_info), ha='center', va='center',
+            transform=ax7.transAxes, fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcyan"))
+    ax7.set_title('(g) Configuration & Parameters')
+    ax7.axis('off')
 
-  if spread_info:
-    ax7.text(0.5,
-             0.7,
-             '\n'.join(spread_info),
-             ha='center',
-             va='center',
-             transform=ax7.transAxes,
-             fontsize=12,
-             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
-  else:
-    ax7.text(0.5, 0.5, 'No spread control', ha='center', va='center', transform=ax7.transAxes)
+    # Plot 8: Frequency response comparison
+    ax8 = fig.add_subplot(gs[2, 0])
+    w_final = metrics.get('final_coeff', w_hist_single[-1, :])
+    n_fft = 1024
 
-  ax7.set_title('(g) Eigenvalue Spread Control')
-  ax7.axis('off')
+    # Get true system response if available
+    unknown_system = metrics.get('unknown_system', None)
+    if unknown_system is not None:
+        h_true = unknown_system
+    elif problem_type == 'time_varying_system_identification' and 'h_true_ensemble' in metrics:
+        h_true = metrics['h_true_ensemble'][0, -1]  # First ensemble, last time step
+    else:
+        h_true = None
 
-  # Plot 8: Frequency response comparison
-  ax8 = fig.add_subplot(gs[2, 1])
-  w_final = w_hist[-1, :]
-  n_fft = 1024
+    if h_true is not None:
+        h_true_1d = np.asarray(jnp.real(h_true)).flatten()
+        w_final_1d = np.asarray(jnp.real(w_final)).flatten()
+        
+        # Ensure same length for frequency response
+        max_len = max(len(h_true_1d), len(w_final_1d))
+        h_true_padded = np.zeros(max_len)
+        w_final_padded = np.zeros(max_len)
+        h_true_padded[:len(h_true_1d)] = h_true_1d
+        w_final_padded[:len(w_final_1d)] = w_final_1d
+        
+        w_freq, h_true_response = signal.freqz(h_true_padded, worN=n_fft)
+        _, h_est_response = signal.freqz(w_final_padded, worN=n_fft)
 
-  if 'unknown_system' in metrics:
-    h_true = metrics['unknown_system']
-    # True system frequency response
-    w_freq, h_true_response = signal.freqz(np.array(jnp.real(h_true)), worN=n_fft)
-    # Estimated system frequency response
-    _, h_est_response = signal.freqz(np.array(jnp.real(w_final)), worN=n_fft)
+        ax8.plot(w_freq / np.pi, 20 * np.log10(np.abs(h_true_response + 1e-10)),
+                'b-', label='True System', linewidth=2)
+        ax8.plot(w_freq / np.pi, 20 * np.log10(np.abs(h_est_response + 1e-10)),
+                'r--', label='Estimated', linewidth=2)
+        ax8.set_ylabel('Magnitude (dB)')
+        ax8.legend()
+    else:
+        w_final_1d = np.asarray(jnp.real(w_final)).flatten()
+        w_freq, h_response = signal.freqz(w_final_1d, worN=n_fft)
+        ax8.plot(w_freq / np.pi, 20 * np.log10(np.abs(h_response + 1e-10)),
+                'b-', label='Estimated Response')
+        ax8.set_ylabel('Magnitude (dB)')
+        ax8.legend()
 
-    ax8.plot(w_freq / np.pi,
-             20 * np.log10(np.abs(h_true_response + 1e-10)),
-             'b-',
-             label='True System',
-             linewidth=2)
-    ax8.plot(w_freq / np.pi,
-             20 * np.log10(np.abs(h_est_response + 1e-10)),
-             'r--',
-             label='Estimated',
-             linewidth=2)
-    ax8.set_ylabel('Magnitude (dB)')
     ax8.set_xlabel('Normalized Frequency (×π rad/sample)')
     ax8.set_title('(h) Frequency Response Comparison')
-    ax8.legend()
-  else:
-    w_freq, h_response = signal.freqz(np.array(jnp.real(w_final)), worN=n_fft)
-    ax8.plot(w_freq / np.pi, 20 * np.log10(np.abs(h_response + 1e-10)))
-    ax8.set_ylabel('Magnitude (dB)')
-    ax8.set_xlabel('Normalized Frequency (×π rad/sample)')
-    ax8.set_title('(h) Final Filter Frequency Response')
-  ax8.grid(True, alpha=0.3)
+    ax8.grid(True, alpha=0.3)
 
-  # Plot 9: Error distribution analysis
-  ax9 = fig.add_subplot(gs[2, 2])
-  # Take the last 1000 samples for better statistics, if available
-  n_samples_hist = min(1000, len(e_hist))
-  last_errors = e_hist[-n_samples_hist:]
+    # Plot 9: Error distribution - use last errors from first ensemble member
+    ax9 = fig.add_subplot(gs[2, 1])
+    n_samples_hist = min(1000, len(e_hist_single))
+    last_errors = e_hist_single[-n_samples_hist:]
+    real_errors = np.asarray(jnp.real(last_errors))
 
-  # Ensure data is numpy array for hist
-  real_errors = np.asarray(jnp.real(last_errors))
-  imag_errors = np.asarray(jnp.imag(last_errors))
+    if len(real_errors) > 0:
+        ax9.hist(real_errors, bins=20, alpha=0.7, label='Real', density=True)
+        try:
+            mu, std = scipy.stats.norm.fit(real_errors)
+            x = np.linspace(ax9.get_xlim()[0], ax9.get_xlim()[1], 100)
+            ax9.plot(x, scipy.stats.norm.pdf(x, mu, std), 'k-', linewidth=2,
+                   label=f'Normal fit\nμ={mu:.3f}, σ={std:.3f}')
+        except:
+            pass  # Skip normal fit if it fails
 
-  ax9.hist(real_errors, bins=20, alpha=0.7, label='Real', density=True)
-
-  is_complex = not np.allclose(imag_errors, 0)
-  if is_complex:
-    ax9.hist(imag_errors, bins=20, alpha=0.7, label='Imag', density=True)
-
-  # Add Gaussian fit to the real part
-  mu, std = scipy.stats.norm.fit(real_errors)
-  x = np.linspace(ax9.get_xlim()[0], ax9.get_xlim()[1], 100)
-  ax9.plot(x,
-           scipy.stats.norm.pdf(x, mu, std),
-           'k-',
-           linewidth=2,
-           label=f'Normal fit\nμ={mu:.3f}, σ={std:.3f}')
-
-  ax9.set_ylabel('Probability Density')
-  ax9.set_xlabel('Error Value')
-  ax9.set_title(f'(i) Error Distribution (last {n_samples_hist} samples)')
-  ax9.legend()
-  ax9.grid(True, alpha=0.3)
-
-  # Plot 10: Convergence speed analysis
-  ax10 = fig.add_subplot(gs[3, 0])
-  # Moving average of MSE with different window sizes
-  for window in [ 10, 50, 100 ]:
-    if len(mse_curve_np) > window:
-      mse_smooth = np.convolve(mse_curve_np, np.ones(window) / window, mode='valid')
-      # Plot against the central point of the window for better alignment
-      x_axis = np.arange(len(mse_smooth)) + window // 2
-      ax10.semilogy(x_axis, mse_smooth, label=f'Window={window}', alpha=0.8)
-
-  ax10.set_ylabel('Smoothed MSE')
-  ax10.set_xlabel('Iteration')
-  ax10.set_title('(j) Multi-Scale Learning Curves')
-  ax10.legend()
-  ax10.grid(True, alpha=0.3)
-
-  # Plot 11: Misadjustment vs Theoretical (Scatter/Line comparison)
-  ax11 = fig.add_subplot(gs[3, 1])
-  if 'misadjustment_curve' in metrics and 'misadjustment_theoretical' in metrics:
-    misadjustment_curve = np.asarray(metrics['misadjustment_curve'])
-    theoretical_m = metrics['misadjustment_theoretical']
-
-    # Plot the ratio of empirical to theoretical
-    ratio_curve = misadjustment_curve / theoretical_m
-
-    ax11.plot(ratio_curve, 'purple', alpha=0.7, linewidth=1)
-    ax11.axhline(y=1.0, color='r', linestyle='--', linewidth=2, label='Theoretical Reference (1.0)')
-
-    # Mark convergence region (last 20% of iterations)
-    convergence_start = int(0.8 * len(ratio_curve))
-    avg_convergence_ratio = np.mean(ratio_curve[convergence_start:])
-    ax11.axhline(y=avg_convergence_ratio,
-                 color='g',
-                 linestyle=':',
-                 linewidth=2,
-                 label=f'Avg Convergence: {avg_convergence_ratio:.3f}')
-
-    ax11.set_ylabel('Empirical / Theoretical')
-    ax11.set_xlabel('Iteration')
-    ax11.set_title('(k) Misadjustment Ratio vs Theory')
-    ax11.grid(True, alpha=0.3)
-    ax11.legend()
-  else:
-    ax11.text(0.5,
-              0.5,
-              'No misadjustment comparison data',
-              ha='center',
-              va='center',
-              transform=ax11.transAxes)
-    ax11.set_title('(k) Misadjustment Ratio vs Theory')
-    ax11.grid(True, alpha=0.3)
-
-  # Plot 12: Summary statistics
-  ax12 = fig.add_subplot(gs[3, 2])
-  summary_text = []
-
-  # Basic metrics
-  summary_text.append(f"Algorithm: {metrics.get('algorithm_name', 'LMS/RLS')}")
-  summary_text.append(f"Iterations: {n_iters}")
-  summary_text.append("-" * 30)
-  if 'mean_mse' in metrics:
-    summary_text.append(f"Mean MSE: {metrics['mean_mse']:.2e}")
-  if 'final_mse' in metrics:
-    summary_text.append(f"Final MSE: {metrics['final_mse']:.2e}")
-  if 'min_mse' in metrics:
-    summary_text.append(f"Minimum MSE: {metrics['min_mse']:.2e}")
-  if 'misadjustment' in metrics:
-    summary_text.append(f"Final Misadjustment: {metrics['misadjustment']:.4f}")
-  if 'misadjustment_theoretical' in metrics:
-    summary_text.append(f"Theoretical M: {metrics['misadjustment_theoretical']:.4f}")
-
-  summary_text.append("-" * 30)
-
-  # Convergence metrics
-  if 'final_coeff_error_true' in metrics:
-    summary_text.append(f"Final Coeff Error (True): {metrics['final_coeff_error_true']:.2e}")
-  if 'final_coeff_error_wiener' in metrics:
-    summary_text.append(f"Final Coeff Error (Wiener): {metrics['final_coeff_error_wiener']:.2e}")
-
-  summary_text.append("-" * 30)
-
-  # Eigenvalue metrics
-  if 'max_eigenvalue' in metrics:
-    summary_text.append(f"Max Eigenvalue: {metrics['max_eigenvalue']:.4f}")
-  if 'min_eigenvalue' in metrics:
-    summary_text.append(f"Min Eigenvalue: {metrics['min_eigenvalue']:.4f}")
-  if 'trace_R' in metrics:
-    summary_text.append(f"Trace(R): {metrics['trace_R']:.4f}")
-
-  ax12.text(0.02,
-            0.5,
-            '\n'.join(summary_text),
-            va='center',
-            ha='left',
-            fontsize=9,
-            family='monospace',
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray"))
-  ax12.set_title('(l) Summary Statistics')
-  ax12.axis('off')
-
-  # Plot 13: Additional performance analysis
-  ax13 = fig.add_subplot(gs[4, :])
-
-  analysis_text = []
-  analysis_text.append("PERFORMANCE ANALYSIS")
-  analysis_text.append("=" * 40)
-
-  # Misadjustment analysis
-  if 'misadjustment' in metrics and 'misadjustment_theoretical' in metrics:
-    empirical_m = metrics['misadjustment']
-    theoretical_m = metrics['misadjustment_theoretical']
-    error_percent = abs(empirical_m - theoretical_m) / theoretical_m * 100
-    analysis_text.append(f"Misadjustment Error: {error_percent:.1f}%")
-
-    if error_percent < 10:
-      analysis_text.append("✓ Good agreement with theory")
-    elif error_percent < 25:
-      analysis_text.append("~ Moderate agreement with theory")
+        ax9.set_ylabel('Probability Density')
+        ax9.set_xlabel('Error Value')
+        ax9.legend()
     else:
-      analysis_text.append("✗ Poor agreement with theory")
+        ax9.text(0.5, 0.5, 'No error data', 
+               ha='center', va='center', transform=ax9.transAxes)
+    
+    ax9.set_title('(i) Error Distribution')
+    ax9.grid(True, alpha=0.3)
 
-  # Convergence analysis
-  if 'convergence_20dB_iter' in metrics:
-    conv_iter = metrics['convergence_20dB_iter']
-    analysis_text.append(f"Convergence (-20dB): {conv_iter} iterations")
-    if conv_iter < n_iters * 0.3:
-      analysis_text.append("✓ Fast convergence")
-    elif conv_iter < n_iters * 0.7:
-      analysis_text.append("~ Moderate convergence speed")
+    # Plot 10: Multi-scale learning curves
+    ax10 = fig.add_subplot(gs[3, 0])
+    for window in [10, 50, 100]:
+        if len(mse_curve_np) > window:
+            mse_smooth = np.convolve(mse_curve_np, np.ones(window) / window, mode='valid')
+            x_axis = np.arange(len(mse_smooth)) + window // 2
+            ax10.semilogy(x_axis, mse_smooth, label=f'Window={window}', alpha=0.8)
+
+    ax10.set_ylabel('Smoothed MSE')
+    ax10.set_xlabel('Iteration')
+    ax10.set_title('(j) Multi-Scale Learning Curves')
+    ax10.legend()
+    ax10.grid(True, alpha=0.3)
+
+    # Summary statistics (always last row)
+    ax_summary = fig.add_subplot(gs[4, :])
+    summary_text = _generate_summary_text(metrics, n_iters, problem_type, n_ensemble)
+
+    ax_summary.text(0.02, 0.5, '\n'.join(summary_text), va='center', ha='left',
+                   fontsize=9, family='monospace',
+                   bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray"))
+    ax_summary.set_title('(k) Summary Statistics')
+    ax_summary.axis('off')
+
+    plt.tight_layout()
+    return fig
+
+
+def _calculate_mse_surface(w0_hist, w1_hist, metrics):
+    """Calculate MSE surface using your actual metric names"""
+    w0_min, w0_max = jnp.min(w0_hist), jnp.max(w0_hist)
+    w1_min, w1_max = jnp.min(w1_hist), jnp.max(w1_hist)
+    padding = 0.2
+    w0_range = jnp.linspace(w0_min - padding, w0_max + padding, 50)
+    w1_range = jnp.linspace(w1_min - padding, w1_max + padding, 50)
+    W0, W1 = jnp.meshgrid(w0_range, w1_range)
+
+    # Use your actual metric names: metrics['R'] and metrics['p']
+    has_wiener_info = ('wiener_solution' in metrics and 'R' in metrics and 'p' in metrics)
+
+    if has_wiener_info:
+        w_wiener = metrics['wiener_solution']
+        w_wiener_2d = jnp.real(w_wiener[:2])
+        R = metrics['R'][:2, :2]  # 2x2 submatrix
+        p = metrics['p'][:2]  # First 2 elements
+        # Estimate signal power from available data
+        sigma_d2 = 1.0  # Default, you might want to calculate this from your signals
+
+        W0_flat, W1_flat = W0.flatten(), W1.flatten()
+        W_stack = jnp.column_stack([W0_flat, W1_flat])
+
+        mse_values = []
+        for i in range(len(W_stack)):
+            w_vec = W_stack[i]
+            mse = sigma_d2 - 2 * jnp.real(jnp.vdot(w_vec, p)) + jnp.real(jnp.vdot(w_vec, R @ w_vec))
+            mse_values.append(mse)
+
+        MSE_surface = jnp.array(mse_values).reshape(W0.shape)
     else:
-      analysis_text.append("✗ Slow convergence")
+        # Fallback quadratic surface - ensure positive values
+        MSE_surface = W0**2 + W1**2 + 1e-10  # Add small constant to avoid zeros
 
-  # Coefficient accuracy
-  if 'final_coeff_error_true' in metrics:
-    coeff_error = metrics['final_coeff_error_true']
-    analysis_text.append(f"Coefficient Error: {coeff_error:.2e}")
-    if coeff_error < 0.1:
-      analysis_text.append("✓ Good system identification")
-    elif coeff_error < 0.3:
-      analysis_text.append("~ Moderate identification")
+    return W0, W1, MSE_surface
+
+
+def _calculate_path_mse(w0_hist_np, w1_hist_np, metrics):
+    """Calculate MSE along the convergence path using your actual metric names"""
+    path_mse = []
+    has_wiener_info = ('wiener_solution' in metrics and 'R' in metrics and 'p' in metrics)
+
+    if has_wiener_info:
+        R = metrics['R'][:2, :2]
+        p = metrics['p'][:2]
+        sigma_d2 = 1.0  # Default signal power
+
+        for i in range(len(w0_hist_np)):
+            w_vec = jnp.array([w0_hist_np[i], w1_hist_np[i]])
+            mse = sigma_d2 - 2 * jnp.real(jnp.vdot(w_vec, p)) + jnp.real(jnp.vdot(w_vec, R @ w_vec))
+            path_mse.append(float(mse))
     else:
-      analysis_text.append("✗ Poor identification")
+        # Fallback - ensure positive values
+        for i in range(len(w0_hist_np)):
+            path_mse.append(w0_hist_np[i]**2 + w1_hist_np[i]**2 + 1e-10)
 
-  ax13.text(0.02,
-            0.5,
-            '\n'.join(analysis_text),
-            va='center',
-            ha='left',
-            fontsize=10,
-            family='monospace',
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightyellow"))
-  ax13.set_title('(m) Performance Analysis')
-  ax13.axis('off')
+    return path_mse
 
-  plt.tight_layout()
+def _calculate_path_mse(w0_hist_np, w1_hist_np, metrics):
+    """Calculate MSE along the convergence path using your actual metric names"""
+    path_mse = []
+    has_wiener_info = ('wiener_solution' in metrics and 'R' in metrics and 'p' in metrics)
 
-  return fig
+    if has_wiener_info:
+        R = metrics['R'][:2, :2]
+        p = metrics['p'][:2]
+        sigma_d2 = 1.0  # Default signal power
 
+        for i in range(len(w0_hist_np)):
+            w_vec = jnp.array([w0_hist_np[i], w1_hist_np[i]])
+            mse = sigma_d2 - 2 * jnp.real(jnp.vdot(w_vec, p)) + jnp.real(jnp.vdot(w_vec, R @ w_vec))
+            path_mse.append(float(mse))
+    else:
+        # Fallback
+        for i in range(len(w0_hist_np)):
+            path_mse.append(w0_hist_np[i]**2 + w1_hist_np[i]**2)
 
-def theoretical_fixed_point_lms_performance(mu: float, sigma_x2: float, sigma_n2: float,
-                                            sigma_e2: float, sigma_w2: float, flter_ord: int):
-  """Calculate theoretical performance for fixed-point LMS"""
+    return path_mse
 
-  N = flter_ord
-  denom = 1 - mu * (N + 1) * sigma_x2
+def plot_convergence_path_3d(w_hist: _Array, metrics: Dict[str, Any], ax=None, ensemble_idx: int = 0):
+    """
+    Plot 3D convergence path on MSE surface as a separate function
+    
+    Args:
+        w_hist: Coefficient history array with shape (n_ensemble, n_samples+1, n_coef) or (n_samples+1, n_coef)
+        metrics: Performance metrics dictionary
+        ax: Matplotlib 3D axis to plot on (if None, creates new figure)
+        ensemble_idx: Which ensemble member to plot (default: 0 for first member, -1 for ensemble average)
+    
+    Returns:
+        matplotlib.Figure or None
+    """
+    # Handle ensemble data
+    if w_hist.ndim == 3:  # Ensemble data: (n_ensemble, n_samples+1, n_coef)
+        n_ensemble = w_hist.shape[0]
+        
+        if ensemble_idx == -1:
+            # Use ensemble average
+            w_hist_single = jnp.mean(w_hist, axis=0)  # Average across ensemble
+            ensemble_label = "Ensemble Average"
+        else:
+            # Use specified ensemble member
+            w_hist_single = w_hist[ensemble_idx]
+            ensemble_label = f"Ensemble {ensemble_idx+1}/{n_ensemble}"
+            
+    else:  # Single realization: (n_samples+1, n_coef)
+        w_hist_single = w_hist
+        n_ensemble = 1
+        ensemble_label = "Single Realization"
+    
+    n_coeffs = w_hist_single.shape[1]
+    
+    if n_coeffs < 2:
+        if ax is None:
+            fig = plt.figure(figsize=(8, 6))
+            ax = fig.add_subplot(111, projection='3d')
+        ax.text(0.5, 0.5, 0, 'Need ≥2 coefficients\nfor 3D surface', 
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(f'3D MSE Surface ({ensemble_label})')
+        ax.set_xlabel('Re(w₀)')
+        ax.set_ylabel('Re(w₁)')
+        ax.set_zlabel('log10(MSE)')
+        return fig if ax is None else None
+    
+    # Extract first two coefficients
+    w0_hist = jnp.real(w_hist_single[:, 0])
+    w1_hist = jnp.real(w_hist_single[:, 1])
+    
+    # Calculate MSE surface
+    W0, W1, MSE_surface = _calculate_mse_surface(w0_hist, w1_hist, metrics)
+    W0_np, W1_np, MSE_surface_np = np.array(W0), np.array(W1), np.array(MSE_surface)
+    w0_hist_np, w1_hist_np = np.array(w0_hist), np.array(w1_hist)
 
-  # Equation B.26: Expected coefficient error norm squared
-  E_delta_w_norm_sq = (mu * (sigma_n2 + sigma_e2) * (N + 1)) / denom + \
-                     ((N + 1) * sigma_w2) / (4 * mu * sigma_x2 * denom)
+    # Create figure if no axis provided
+    if ax is None:
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        return_fig = True
+    else:
+        fig = None
+        return_fig = False
 
-  # Equation B.32: Excess MSE
-  xi_Q = (sigma_e2 + sigma_n2) / denom + \
-        ((N + 1) * sigma_w2) / (4 * mu * sigma_x2 * denom)
+    # Handle invalid values for log10
+    mse_surface_safe = np.where(MSE_surface_np <= 0, 1e-10, MSE_surface_np)
+    surface_z = np.log10(mse_surface_safe)
+    
+    # Check for any remaining invalid values
+    if np.any(~np.isfinite(surface_z)):
+        surface_z = np.where(~np.isfinite(surface_z), np.nanmin(surface_z[np.isfinite(surface_z)]), surface_z)
+    
+    ax.plot_surface(W0_np, W1_np, surface_z,
+                   cmap='viridis', alpha=0.7, linewidth=0, antialiased=True)
 
-  return E_delta_w_norm_sq, xi_Q
+    # Add convergence path to 3D plot
+    path_mse = _calculate_path_mse(w0_hist_np, w1_hist_np, metrics)
+    
+    # Handle invalid values for path MSE
+    path_mse_safe = np.where(np.array(path_mse) <= 0, 1e-10, np.array(path_mse))
+    path_mse_np_log = np.log10(path_mse_safe)
+    
+    # Check for any remaining invalid values
+    if np.any(~np.isfinite(path_mse_np_log)):
+        path_mse_np_log = np.where(~np.isfinite(path_mse_np_log), 
+                                  np.nanmin(path_mse_np_log[np.isfinite(path_mse_np_log)]), 
+                                  path_mse_np_log)
 
+    # Plot convergence path
+    ax.plot(w0_hist_np, w1_hist_np, path_mse_np_log, 'r-', linewidth=2, alpha=0.8, label='Convergence Path')
+    ax.scatter(w0_hist_np[0], w1_hist_np[0], path_mse_np_log[0],
+              color='green', s=50, edgecolor='black', label='Start')
+    ax.scatter(w0_hist_np[-1], w1_hist_np[-1], path_mse_np_log[-1],
+              color='blue', s=50, edgecolor='black', label='End')
 
-def analyze_convergence_path(w_hist: _Array, metrics: Dict[str, Any]):
+    # Mark Wiener solution if available
+    if 'wiener_solution' in metrics:
+        w_wiener = metrics['wiener_solution']
+        if len(w_wiener) >= 2:
+            w0_opt = jnp.real(w_wiener[0])
+            w1_opt = jnp.real(w_wiener[1])
+            
+            # Calculate MSE at Wiener solution
+            w_opt_mse = _calculate_mse_at_point(w0_opt, w1_opt, metrics)
+            w_opt_mse_safe = max(w_opt_mse, 1e-10)
+            w_opt_mse_log = np.log10(w_opt_mse_safe)
+            
+            ax.scatter(w0_opt, w1_opt, w_opt_mse_log,
+                      color='red', s=100, marker='*', edgecolor='black', 
+                      label='Wiener Solution')
+
+    ax.set_xlabel('Re(w₀)')
+    ax.set_ylabel('Re(w₁)')
+    ax.set_zlabel('log10(MSE)')
+    ax.set_title(f'3D MSE Surface with Convergence Path\n({ensemble_label})')
+    ax.legend()
+    
+    return fig if return_fig else None
+
+def _calculate_mse_at_point(w0: float, w1: float, metrics: Dict[str, Any]) -> float:
+    """Calculate MSE at a specific point in coefficient space"""
+    if 'wiener_solution' in metrics and 'R' in metrics and 'p' in metrics:
+        w_wiener_sol = metrics['wiener_solution']
+        R = metrics['R'][:2, :2]  # 2x2 submatrix
+        p = metrics['p'][:2]      # First 2 elements
+        
+        # MSE = σ_d² - 2Re(w^H p) + w^H R w
+        if 'min_mse' in metrics:
+            sigma_d2 = metrics['min_mse']
+        else:
+            sigma_d2 = 1.0  # Fallback
+            
+        w_vec = jnp.array([w0, w1])
+        mse = sigma_d2 - 2 * jnp.real(jnp.vdot(w_vec, p)) + jnp.real(jnp.vdot(w_vec, R @ w_vec))
+        return float(mse)
+    else:
+        # Fallback: quadratic surface
+        return w0**2 + w1**2
+
+def analyze_convergence_path(w_hist: _Array, metrics: Dict[str, Any], ensemble_idx: int = -1):
   """
   Analyzes the convergence path on the MSE surface (for the first two coefficients)
   and returns the matplotlib Figure object while printing convergence statistics.
+  
+  Args:
+      w_hist: Coefficient history with shape (n_ensemble, n_samples+1, n_coef) or (n_samples+1, n_coef)
+      metrics: Performance metrics dictionary
+      ensemble_idx: Which ensemble member to plot 
+                   (default: 0 for first member, -1 for ensemble average)
   """
-  if w_hist.shape[1] < 2:
+  # Handle ensemble data
+  if w_hist.ndim == 3:  # Ensemble data: (n_ensemble, n_samples+1, n_coef)
+      n_ensemble = w_hist.shape[0]
+      
+      if ensemble_idx == -1:
+          # Use ensemble average
+          w_hist_single = jnp.mean(w_hist, axis=0)  # Average across ensemble
+          ensemble_label = "Ensemble Average"
+      else:
+          # Use specified ensemble member
+          w_hist_single = w_hist[ensemble_idx]
+          ensemble_label = f"Ensemble {ensemble_idx+1}/{n_ensemble}"
+          
+  else:  # Single realization: (n_samples+1, n_coef)
+      w_hist_single = w_hist
+      n_ensemble = 1
+      ensemble_label = "Single Realization"
+  
+  if w_hist_single.shape[1] < 2:
     print("Need at least 2 coefficients for convergence path analysis")
     return None
 
   # Extract first two coefficients (real parts for 2D visualization)
-  w0_hist = jnp.real(w_hist[:, 0])
-  w1_hist = jnp.real(w_hist[:, 1])
+  w0_hist = jnp.real(w_hist_single[:, 0])
+  w1_hist = jnp.real(w_hist_single[:, 1])
 
   # Create appropriate ranges for the MSE surface
   w0_min, w0_max = jnp.min(w0_hist), jnp.max(w0_hist)
@@ -1264,17 +1317,21 @@ def analyze_convergence_path(w_hist: _Array, metrics: Dict[str, Any]):
 
   # Calculate actual MSE surface using Wiener solution
   is_wiener_info_available = ('wiener_solution' in metrics and
-                              'autocorrelation_matrix' in metrics and
-                              'crosscorrelation_vector' in metrics and 'desired_signal' in metrics)
+                              'R' in metrics and
+                              'p' in metrics)
 
   if is_wiener_info_available:
     w_wiener_sol = metrics['wiener_solution']
     w_wiener = jnp.real(w_wiener_sol[:2])  # First 2 coefficients
-    R = metrics['autocorrelation_matrix'][:2, :2]  # 2x2 submatrix
-    p = metrics['crosscorrelation_vector'][:2]  # First 2 elements
+    R = metrics['R'][:2, :2]  # 2x2 submatrix
+    p = metrics['p'][:2]      # First 2 elements
 
     # MSE = σ_d² - 2Re(w^H p) + w^H R w
-    sigma_d2 = jnp.mean(jnp.abs(metrics.get('desired_signal', 1.0))**2)
+    # Estimate σ_d² from min_mse or use theoretical value
+    if 'min_mse' in metrics:
+        sigma_d2 = metrics['min_mse']
+    else:
+        sigma_d2 = 1.0  # Fallback
 
     # Vectorized MSE calculation
     W0_flat = W0.flatten()
@@ -1293,9 +1350,9 @@ def analyze_convergence_path(w_hist: _Array, metrics: Dict[str, Any]):
   else:
     # Fallback: simple quadratic surface centered at (0,0)
     MSE_surface = W0**2 + W1**2
-    if 'wiener_solution' in metrics and 'autocorrelation_matrix' in metrics:
+    if 'wiener_solution' in metrics:
       print(
-          "Warning: Missing 'crosscorrelation_vector' or 'desired_signal' for full Wiener MSE calculation. Using quadratic fallback."
+          "Warning: Missing 'R' or 'p' for full Wiener MSE calculation. Using quadratic fallback."
       )
 
   # Convert to numpy for plotting
@@ -1312,8 +1369,8 @@ def analyze_convergence_path(w_hist: _Array, metrics: Dict[str, Any]):
   plt.subplot(2, 2, 1)
 
   # Use logarithmic spacing for contour levels to better show the bowl shape
-  min_mse = np.min(MSE_surface_np)
-  max_mse = np.max(MSE_surface_np)
+  min_mse = np.maximum(0.0, np.min(MSE_surface_np))
+  max_mse = np.maximum(0.0, np.max(MSE_surface_np))
   levels = np.logspace(np.log10(min_mse + 1e-10), np.log10(max_mse), 15)
 
   contour = plt.contour(W0_np,
@@ -1359,53 +1416,34 @@ def analyze_convergence_path(w_hist: _Array, metrics: Dict[str, Any]):
 
   plt.xlabel('Re(w₀)')
   plt.ylabel('Re(w₁)')
-  plt.title('Convergence Path on MSE Surface')
+  plt.title(f'Convergence Path on MSE Surface ({ensemble_label})')
   plt.legend()
   plt.grid(True, alpha=0.3)
 
-  # Plot 2: 3D surface plot
-  ax = plt.subplot(2, 2, 2, projection='3d')
-  ax.plot_surface(W0_np,
-                  W1_np,
-                  np.log10(MSE_surface_np + 1e-10),
-                  cmap='viridis',
-                  alpha=0.7,
-                  linewidth=0,
-                  antialiased=True)
-
-  # Plot convergence path in 3D
-  path_mse = []
-  if is_wiener_info_available:
-    # Use the calculated Wiener parameters
-    for i in range(len(w0_hist_np)):
-      w_vec = jnp.array([w0_hist_np[i], w1_hist_np[i]])
-      mse = sigma_d2 - 2 * jnp.real(jnp.vdot(w_vec, p)) + jnp.real(jnp.vdot(w_vec, R @ w_vec))
-      path_mse.append(float(mse))
-  else:
-    # Use fallback MSE for path if Wiener info is missing
-    for i in range(len(w0_hist_np)):
-      path_mse.append(w0_hist_np[i]**2 + w1_hist_np[i]**2)
-
-  path_mse_np_log = np.log10(np.array(path_mse) + 1e-10)
-
-  ax.plot(w0_hist_np, w1_hist_np, path_mse_np_log, 'r-', linewidth=2, alpha=0.8)
-  ax.scatter(w0_hist_np[0],
-             w1_hist_np[0],
-             path_mse_np_log[0],
-             color='green',
-             s=50,
-             edgecolor='black')
-  ax.scatter(w0_hist_np[-1],
-             w1_hist_np[-1],
-             path_mse_np_log[-1],
-             color='blue',
-             s=50,
-             edgecolor='black')
-
-  ax.set_xlabel('Re(w₀)')
-  ax.set_ylabel('Re(w₁)')
-  ax.set_zlabel('log10(MSE)')
-  ax.set_title('3D MSE Surface with Convergence Path')
+  # Plot 2: Individual coefficient evolution
+  plt.subplot(2, 2, 2)
+  iterations = np.arange(len(w0_hist_np))
+  plt.plot(iterations, w0_hist_np, 'b-', label='w[0]', alpha=0.7, linewidth=2)
+  plt.plot(iterations, w1_hist_np, 'r-', label='w[1]', alpha=0.7, linewidth=2)
+  
+  # Mark Wiener solutions
+  if 'wiener_solution' in metrics:
+    w_wiener = metrics['wiener_solution']
+    plt.axhline(y=jnp.real(w_wiener[0]), color='b', linestyle='--', alpha=0.5, label='w_opt[0]')
+    plt.axhline(y=jnp.real(w_wiener[1]), color='r', linestyle='--', alpha=0.5, label='w_opt[1]')
+  
+  # Mark true system if available
+  if 'unknown_system' in metrics:
+    h_true = metrics['unknown_system']
+    if len(h_true) >= 2:
+      plt.axhline(y=jnp.real(h_true[0]), color='b', linestyle=':', alpha=0.5, label='h_true[0]')
+      plt.axhline(y=jnp.real(h_true[1]), color='r', linestyle=':', alpha=0.5, label='h_true[1]')
+  
+  plt.xlabel('Iteration')
+  plt.ylabel('Coefficient Value')
+  plt.title('Coefficient Evolution')
+  plt.legend()
+  plt.grid(True, alpha=0.3)
 
   # Plot 3: Distance to Wiener solution over time
   plt.subplot(2, 2, 3)
@@ -1446,8 +1484,8 @@ def analyze_convergence_path(w_hist: _Array, metrics: Dict[str, Any]):
 
   plt.tight_layout()
 
-  # Print convergence statistics (KEPT AS REQUESTED)
-  print("\n=== CONVERGENCE ANALYSIS ===")
+  # Print convergence statistics
+  print(f"\n=== CONVERGENCE ANALYSIS ({ensemble_label}) ===")
   print(f"Total iterations: {len(w0_hist_np)}")
   print(f"Initial coefficients: w0={w0_hist_np[0]:.4f}, w1={w1_hist_np[0]:.4f}")
   print(f"Final coefficients: w0={w0_hist_np[-1]:.4f}, w1={w1_hist_np[-1]:.4f}")
@@ -1472,121 +1510,3 @@ def analyze_convergence_path(w_hist: _Array, metrics: Dict[str, Any]):
     print("Not enough iterations to calculate path length or average step size.")
 
   return fig
-
-
-def analyze_convergence_path_2d(w_hist: _Array, metrics: Dict[str, Any]):
-  """
-  Simplified version of convergence path analysis (2D) that returns the Figure.
-  """
-  if w_hist.shape[1] < 2:
-    print("Need at least 2 coefficients for convergence path analysis")
-    return None  # Return None if the condition is not met
-
-  # Extract first two coefficients
-  w0_hist = jnp.real(w_hist[:, 0])
-  w1_hist = jnp.real(w_hist[:, 1])
-
-  # Create appropriate ranges
-  padding = 0.3
-  w0_range = jnp.linspace(jnp.min(w0_hist) - padding, jnp.max(w0_hist) + padding, 50)
-  w1_range = jnp.linspace(jnp.min(w1_hist) - padding, jnp.max(w1_hist) + padding, 50)
-  W0, W1 = jnp.meshgrid(w0_range, w1_range)
-
-  # Calculate MSE surface
-  if 'wiener_solution' in metrics:
-    w_wiener = metrics['wiener_solution']
-    # Simple quadratic surface centered at Wiener solution (Approximation)
-    MSE_surface = (W0 - jnp.real(w_wiener[0]))**2 + (W1 - jnp.real(w_wiener[1]))**2
-  else:
-    # Fallback surface centered at origin
-    MSE_surface = W0**2 + W1**2
-
-  fig = plt.figure(figsize=(10, 8))
-
-  # Use better contour levels
-  # Convert to numpy for min/max
-  MSE_surface_np = np.array(MSE_surface)
-  levels = np.linspace(np.min(MSE_surface_np), np.max(MSE_surface_np), 10)
-
-  # Ensure W0, W1 are numpy arrays for contour plotting if they were JAX arrays
-  W0_np = np.array(W0)
-  W1_np = np.array(W1)
-
-  contour = plt.contour(W0_np, W1_np, MSE_surface_np, levels=levels, alpha=0.6, colors='gray')
-  plt.clabel(contour, inline=True, fontsize=9, fmt='%.1f')
-
-  # Convert path to numpy for plotting robustness
-  w0_hist_np = np.array(w0_hist)
-  w1_hist_np = np.array(w1_hist)
-
-  # Plot convergence path
-  plt.plot(w0_hist_np, w1_hist_np, 'r-', linewidth=2, alpha=0.7, label='Convergence Path')
-  plt.plot(w0_hist_np[0],
-           w1_hist_np[0],
-           'go',
-           markersize=10,
-           label='Start',
-           markeredgecolor='black')
-  plt.plot(w0_hist_np[-1],
-           w1_hist_np[-1],
-           'bo',
-           markersize=10,
-           label='End',
-           markeredgecolor='black')
-
-  if 'wiener_solution' in metrics:
-    w_wiener_plot = metrics['wiener_solution']
-    plt.plot(jnp.real(w_wiener_plot[0]),
-             jnp.real(w_wiener_plot[1]),
-             'rx',
-             markersize=15,
-             markeredgewidth=2,
-             label='Wiener Solution')
-
-  plt.xlabel('Re(w0)')
-  plt.ylabel('Re(w1)')
-  plt.title('Convergence Path on MSE Surface')
-  plt.legend()
-  plt.grid(True, alpha=0.3)
-
-  return fig
-
-
-def run_multiple_trials(eq: ChannelEqualization,
-                        n_samples: int,
-                        n_trials: int = 10,
-                        use_scan: bool = True) -> Tuple[_Array, _Array]:
-  """Run multiple trials and average results."""
-  all_w_hist = []
-  all_e_hist = []
-  all_metrics = []
-
-  for trial in range(n_trials):
-    print(f"Running trial {trial + 1}/{n_trials}...")
-
-    # Reset the equalizer state for each trial
-    dummy_in = jnp.zeros(eq.lms.filter_order + 1, dtype=jnp.complex64)
-    eq.key, subkey = jax.random.split(eq.key)
-    eq.init_vars = eq.lms.init(subkey, dummy_in)
-
-    # Run simulation
-    w_hist, e_hist, metrics = eq.run(n_samples, use_scan=use_scan)
-
-    all_w_hist.append(w_hist)
-    all_e_hist.append(e_hist)
-    all_metrics.append(metrics)
-
-  # Average results
-  avg_w_hist = jnp.mean(jnp.array(all_w_hist), axis=0)
-  avg_e_hist = jnp.mean(jnp.array(all_e_hist), axis=0)
-  avg_mse = jnp.mean(jnp.array([m['mse_curve'] for m in all_metrics]), axis=0)
-
-  # Create averaged metrics
-  avg_metrics = {
-      'mse_curve': avg_mse,
-      'wiener_solution': all_metrics[0]['wiener_solution'],  # Same for all trials
-      'final_mse': jnp.mean(jnp.array([m['final_mse'] for m in all_metrics])),
-      'final_coeff_error': jnp.mean(jnp.array([m['final_coeff_error'] for m in all_metrics]))
-  }
-
-  return avg_w_hist, avg_e_hist, avg_metrics, all_metrics

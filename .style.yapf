@@ -6,7 +6,7 @@ based_on_style = google
 indent_width = 2
 
 # Set column width limit for readability
-column_limit = 100
+column_limit = 120
 
 # Indent dictionary values for better readability
 indent_dictionary_value = true

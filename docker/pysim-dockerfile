@@ -4,14 +4,32 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG DISPLAY=:0
 ENV DISPLAY=$DISPLAY
 
+# Install required packages for system and font installation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     software-properties-common \
+    wget \
+    unzip \
+    fontconfig \
     git \
     python3-pip \
     python3-dev \
+    # Clean up
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Install Monaco and Consolas fonts
+RUN mkdir -p /usr/share/fonts/truetype/custom \
+    # Install Monaco font
+    && wget -O /usr/share/fonts/truetype/custom/Monaco_Linux.ttf "http://www.gringod.com/wp-upload/software/Fonts/Monaco_Linux.ttf" \
+    # Install Consolas font (using YaHei Consolas Hybrid, a common and functional version on Linux)
+    && wget -O /tmp/YaHei.Consolas.1.12.zip https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/uigroupcode/YaHei.Consolas.1.12.zip \
+    && unzip /tmp/YaHei.Consolas.1.12.zip -d /tmp \
+    && mv /tmp/YaHei.Consolas.1.12.ttf /usr/share/fonts/truetype/custom/YaHei.Consolas.Hybrid.ttf \
+    # Clean up and refresh font cache
+    && rm -rf /tmp/YaHei.Consolas.1.12.zip /tmp/YaHei.Consolas.1.12.ttf /tmp/__MACOSX \
+    && fc-cache -f -v
+
+# Install Python packages
 RUN pip3 install --no-cache-dir --upgrade pip && \
     pip3 install --no-cache-dir \
     numpy \
@@ -41,7 +59,8 @@ RUN pip3 install --no-cache-dir --upgrade pip && \
     flax \
     cr-sparse \
     jaxopt \
-    optimistix 
+    optimistix \
+    jupyterlab-fonts
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
