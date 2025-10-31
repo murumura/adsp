@@ -3,8 +3,9 @@
 ###############################################################################
 
 TopDir          = ${CURDIR}
+PyDir			= $(TopDir)/adsp
 DockerDir       = $(TopDir)/docker
-PyFiles         = $(wildcard $(adsp)/*.py)
+PyFiles         = $(wildcard $(PyDir)/*.py)
 
 # Run Python simulation scripts
 docker-run:
