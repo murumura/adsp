@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import jax.random as random
 from typing import Tuple
 from jax import jit
-
+import jax
 
 class JaxFixedPoint:
 
@@ -56,7 +56,7 @@ class JaxFixedPoint:
     abs_x = jnp.abs(x)
     return sign, abs_x
 
-  def quantize_impl(self,
+  def quantizeImpl(self,
                     x: jnp.ndarray,
                     sign: jnp.ndarray,
                     abs_x: jnp.ndarray,
@@ -137,10 +137,10 @@ class JaxFixedPoint:
           Quantized tensor in fixed-point representation
     """
     sign, abs_x = self.decompose(x)
-    return self.quantize_impl(x, sign, abs_x, key)
+    return self.quantizeImpl(x, sign, abs_x, key)
 
   @staticmethod
-  def quantize_static(sim: 'JaxFixedPoint',
+  def quantizeStatic(sim: 'JaxFixedPoint',
                       x: jnp.ndarray,
                       sign: jnp.ndarray,
                       abs_x: jnp.ndarray,
@@ -203,9 +203,9 @@ class JaxFixedPoint:
     """
 
     sign, abs_x = self.decompose(x)
-    return self.quantize_static(self, x, sign, abs_x, self.rmode, key)
+    return self.quantizeStatic(self, x, sign, abs_x, self.rmode, key)
 
-  def get_format_info(self) -> dict:
+  def getFmtInfo(self) -> dict:
     """Return information about the fixed-point format."""
     return {
         "format": f"Q{self.ibits}.{self.fbits}",
@@ -702,7 +702,7 @@ class JaxFixedPoint:
     return self.quantize(result)
 
 
-def test_fixed_point():
+def testFixedPoint():
   values = jnp.array([ 14.7641, 19.3097, -10.2021, 21.4700, 33.3300 ])
   rmodes = [ 1, 2, 3, 4, 6, 5 ]  # use numeric codes instead of strings
   key = random.PRNGKey(42)
@@ -717,4 +717,4 @@ def test_fixed_point():
 
 
 if __name__ == "__main__":
-  test_fixed_point()
+  testFixedPoint()

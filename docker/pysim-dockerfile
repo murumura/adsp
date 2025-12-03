@@ -17,18 +17,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Clean up
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install Monaco and Consolas fonts
-RUN mkdir -p /usr/share/fonts/truetype/custom \
-    # Install Monaco font
+# Install Monaco and Consolas and SF mono fonts
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget unzip git \
+    && mkdir -p /usr/share/fonts/truetype/custom \
+    \
+    # 1. Install Monaco font
     && wget -O /usr/share/fonts/truetype/custom/Monaco_Linux.ttf "http://www.gringod.com/wp-upload/software/Fonts/Monaco_Linux.ttf" \
-    # Install Consolas font (using YaHei Consolas Hybrid, a common and functional version on Linux)
+    \
+    # 2. Install Consolas font (using YaHei Consolas Hybrid)
     && wget -O /tmp/YaHei.Consolas.1.12.zip https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/uigroupcode/YaHei.Consolas.1.12.zip \
     && unzip /tmp/YaHei.Consolas.1.12.zip -d /tmp \
     && mv /tmp/YaHei.Consolas.1.12.ttf /usr/share/fonts/truetype/custom/YaHei.Consolas.Hybrid.ttf \
-    # Clean up and refresh font cache
-    && rm -rf /tmp/YaHei.Consolas.1.12.zip /tmp/YaHei.Consolas.1.12.ttf /tmp/__MACOSX \
-    && fc-cache -f -v
-
+    \
+    # 3. Install SF Mono font from GitHub repository
+    # Note: We use git and find to place only the .ttf files in the font directory.
+    && git clone --depth 1 https://github.com/supercomputra/SF-Mono-Font /tmp/sf_mono_repo \
+    && find /tmp/sf_mono_repo -name "*.ttf" -exec mv {} /usr/share/fonts/truetype/custom/ \; \
+    \
+    # 4. Clean up and refresh font cache
+    && rm -rf /tmp/YaHei.Consolas.1.12.zip /tmp/sf_mono_repo /tmp/YaHei.Consolas.1.12.ttf /tmp/__MACOSX \
+    && fc-cache -f -v \
+    \
+    # 5. Cleanup apt cache to reduce image size
+    && apt-get purge -y wget unzip git \
+    && apt-get autoremove -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+    
 # Install Python packages
 RUN pip3 install --no-cache-dir --upgrade pip && \
     pip3 install --no-cache-dir \
