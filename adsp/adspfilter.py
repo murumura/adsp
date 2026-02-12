@@ -671,3 +671,102 @@ class AffineProjection(BaseLMS):
     if train:
       self.w = w
     return y_hist, e_hist, w_hist
+
+@dataclass
+class OverLapSaveFDAF(BaseLMS):
+
+  alpha: float = 0.9   # power smoothing factor
+  eps: float = 1e-8    # numerical safety
+
+  def __post_init__(self):
+    super().__post_init__()
+
+    self.fft_size = 2 * self.n_coef
+    self.Wf = np.zeros(self.fft_size, dtype=np.complex64)
+
+    # initialize first M taps in frequency domain
+    w_time = np.zeros(self.fft_size, dtype=np.complex64)
+    w_time[:self.n_coef] = self.w
+    self.Wf = np.fft.fft(w_time)
+
+    self.pow_est = np.ones(self.fft_size, dtype=np.float32) * self.eps
+
+  def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
+
+    x = np.asarray(x, dtype=np.complex64)
+    d = np.asarray(d, dtype=np.complex64)
+
+    N = x.shape[0]
+    M = self.n_coef
+    L = self.fft_size
+
+    if N < M:
+      raise ValueError("Input must be longer than filter order")
+
+    # Pad input for overlap-save
+    x_pad = np.concatenate([np.zeros(M, dtype=np.complex64), x])
+
+    y_hist = np.zeros(N, dtype=np.complex64)
+    e_hist = np.zeros(N, dtype=np.complex64)
+    w_hist = np.zeros((N + 1, M), dtype=np.complex64)
+
+    # time-domain weights (for history)
+    w_time = np.fft.ifft(self.Wf).real[:M]
+    w_hist[0] = w_time
+
+    idx = 0
+    while idx + M <= N:
+
+      # ---- Overlap-Save block ----
+      x_block = x_pad[idx:idx + L]
+      X = np.fft.fft(x_block)
+
+      # Frequency-domain convolution
+      Yf = X * self.Wf
+      y_block = np.fft.ifft(Yf)
+
+      # discard first half (circular part)
+      y_valid = y_block[M:].real
+      d_block = d[idx:idx + M]
+
+      e_block = d_block - y_valid
+
+      y_hist[idx:idx + M] = y_valid
+      e_hist[idx:idx + M] = e_block
+
+      if train:
+
+        # zero pad error (alignment)
+        e_pad = np.concatenate([np.zeros(M), e_block])
+        Ef = np.fft.fft(e_pad)
+
+        # power normalization (NLMS-like)
+        self.pow_est = (
+          self.alpha * self.pow_est
+          + (1 - self.alpha) * (np.abs(X) ** 2)
+        )
+
+        Ef /= (self.pow_est + self.eps)
+
+        # gradient
+        Gf = X.conj() * Ef
+
+        # ---- linear constraint ----
+        g_time = np.fft.ifft(Gf)
+        g_time[M:] = 0   # enforce FIR length M
+        Gf = np.fft.fft(g_time)
+
+        # update
+        self.Wf += self.mu * Gf
+
+      # update weight history
+      w_time = np.fft.ifft(self.Wf).real[:M]
+      w_hist[idx + M] = w_time
+
+      idx += M
+
+    # save back time-domain weights
+    if train:
+      self.w = np.fft.ifft(self.Wf).real[:M]
+
+    return y_hist, e_hist, w_hist
