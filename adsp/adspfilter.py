@@ -44,7 +44,10 @@ def csignscalar(e: Union[complex, Array], eps: float = 1e-12) -> np.complex64:
 
 
 def toeplitzFromFirstRow(first_row: Array) -> Array:
-  """Toeplitz with first row = [r0, r1, ..., r_{M-1}] and Hermitian-symmetric for real AR(1)."""
+  """
+  Toeplitz with first row = [r0, r1, ..., r_{M-1}] 
+  and Hermitian-symmetric for real AR(1).
+  """
   first_row = np.asarray(first_row)
   M = first_row.size
   T = np.empty((M, M), dtype=first_row.dtype)
@@ -59,7 +62,7 @@ def ar1theoR(a: float, order: int, sigma_v2: float = 1.0) -> Array:
   """
   Compute theoretical autocorrelation matrix for AR(1) process.
   Assume the input x(n) is WSS, this is an implmentation of eq 2.83
-  From equation (2.83): R = σ_v²/(1-a²) * Toeplitz([1, a, a², ..., a^(order-1)])
+  From equation (2.83): R = sigma_v²/(1-a²) * Toeplitz([1, a, a², ..., a^(order-1)])
   
   This matches the definition R = E[x(k)x^T(k)] where x(k) = [x(k), x(k-1), ..., x(k-order+1)]^T
   """
@@ -96,6 +99,29 @@ def ar1poleSpreadSearch(
 
   return best_a
 
+def arCorrMatrix(a, u_var, order=1):
+  """
+  Correlation matrix R for AR(1):
+    x(n) = -a x(n-1) + u(n)
+  u_var = var{u(n)}
+  order = filter length M
+  """
+
+  if abs(a) >= 1:
+    raise ValueError("AR(1) is not stationary unless |a| < 1")
+
+  r0 = u_var / (1 - a**2)
+
+  # autocorrelation sequence r(0)...r(M-1)
+  r = np.array([r0 * (-a)**k for k in range(order)])
+
+  # Toeplitz matrix
+  R = np.empty((order, order))
+  for i in range(order):
+    for j in range(order):
+      R[i, j] = r[abs(i - j)]
+
+  return R
 
 def dctOrthoMatrix(M: int, dtype=np.float32) -> Array:
   """
@@ -133,7 +159,7 @@ def _prepad(x: Array, n_coef: int) -> Array:
 # -----------------------------------------------------------------------------
 @dataclass
 class BaseLMS:
-  mu: float
+  mu: float | None
   filter_order: int
   init_coef: Optional[Array] = None
   w: Array = field(init=False)
@@ -147,15 +173,11 @@ class BaseLMS:
       if self.w.shape != (self.n_coef,):
         raise ValueError(f"init_coef must have shape {(self.n_coef,)}, got {self.w.shape}.")
 
-
-# -----------------------------------------------------------------------------
-# LMS
-# -----------------------------------------------------------------------------
 @dataclass
 class LMS(BaseLMS):
   """
   Complex LMS (Diniz Algorithm 3.2)
-    w(k+1) = w(k) + 2 μ e*(k) x(k)
+    w(k+1) = w(k) + 2 mu e*(k) x(k)
   """
 
   def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
@@ -177,7 +199,7 @@ class LMS(BaseLMS):
       e = np.complex64(d[k]) - y
       if train:
         w = (w + (2.0 * self.mu) * np.conj(e) * reg).astype(np.complex64)
-
+        
       y_hist[k] = y
       e_hist[k] = e
       w_hist[k + 1] = w
@@ -238,18 +260,18 @@ class LMS(BaseLMS):
     print("\n" + "=" * 60)
     print("LMS STEP SIZE ANALYSIS")
     print("=" * 60)
-    print(f"Current μ: {a['current_mu']:.6f}")
+    print(f"Current mu: {a['current_mu']:.6f}")
     print(f"Stability: {'✓ STABLE' if a['is_stable_R'] else '✗ UNSTABLE'}")
 
     print("\nEIGENVALUE ANALYSIS:")
-    print(f"  Max eigenvalue (λ_max): {a['lambda_max']:.6f}")
-    print(f"  Min eigenvalue (λ_min): {a['lambda_min']:.6f}")
+    print(f"  Max eigenvalue (lambda_max): {a['lambda_max']:.6f}")
+    print(f"  Min eigenvalue (lambda_min): {a['lambda_min']:.6f}")
     print(f"  Eigenvalue spread: {a['eigenvalue_spread']:.2f}")
     if a["convergence_warning"]:
       print("  WARNING: High eigenvalue spread will slow convergence")
 
     print("\nSTABILITY BOUNDS:")
-    print(f"  From eigenvalues (1/λ_max): {a['max_stable_mu_eigenvalue']:.6f}")
+    print(f"  From eigenvalues (1/lambda_max): {a['max_stable_mu_eigenvalue']:.6f}")
     print(f"  From trace (1/tr[R]): {a['max_stable_mu_trace']:.6f}")
 
     print("\nPERFORMANCE PREDICTIONS:")
@@ -260,7 +282,7 @@ class LMS(BaseLMS):
       approx_iters = 4.6 * slow_tc
       print(f"  Approx. convergence iterations: {approx_iters:.0f}")
 
-    print("\nRECOMMENDED μ RANGES:")
+    print("\nRECOMMENDED mu RANGES:")
     print(f"  Conservative: {a['suggested_conservative_mu']:.6f}")
     print(f"  Aggressive:   {a['suggested_aggressive_mu']:.6f}")
 
@@ -281,7 +303,7 @@ class LMS(BaseLMS):
 class SignErrorLMS(BaseLMS):
   """
   Complex Sign-Error LMS (Diniz Algorithm 4.1, complex extension)
-    w(k+1) = w(k) + 2 μ sgn[e(k)] x(k)
+    w(k+1) = w(k) + 2 mu sgn[e(k)] x(k)
   """
 
   def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
@@ -317,7 +339,7 @@ class SignErrorLMS(BaseLMS):
 class SignDataLMS(BaseLMS):
   """
   Complex Sign-Data LMS (Diniz Algorithm 4.2, complex extension)
-    w(k+1) = w(k) + 2 μ e*(k) sgn[x(k)]
+    w(k+1) = w(k) + 2 mu e*(k) sgn[x(k)]
   """
 
   def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
@@ -353,7 +375,7 @@ class SignDataLMS(BaseLMS):
 class SignSignLMS(BaseLMS):
   """
   Complex Sign-Sign LMS (Diniz Sec. 4.2.4 extended)
-    w(k+1) = w(k) + 2 μ sgn[e(k)] sgn[x(k)]
+    w(k+1) = w(k) + 2 mu sgn[e(k)] sgn[x(k)]
   """
 
   def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
@@ -391,9 +413,9 @@ class DualSignLMS(BaseLMS):
   """
   Complex Dual-Sign LMS (Diniz Sec. 4.2.3 style)
   if |e(k)| > rho:
-      w(k+1) = w(k) + 2 μ ε sgn[e(k)] x(k)
+      w(k+1) = w(k) + 2 mu ε sgn[e(k)] x(k)
   else:
-      w(k+1) = w(k) + 2 μ sgn[e(k)] x(k)
+      w(k+1) = w(k) + 2 mu sgn[e(k)] x(k)
   """
   epsilon: float = 2.0
   rho: float = 1.0
@@ -436,7 +458,7 @@ class PowerOfTwoErrorLMS(BaseLMS):
   """
   Power-of-Two Error LMS (Diniz Sec. 4.2.3)
     pe[e] as in Eq. (4.40)
-    w(k+1) = w(k) + 2 μ pe[e(k)] x(k)
+    w(k+1) = w(k) + 2 mu pe[e(k)] x(k)
   """
   bd: int = 8
   tau: float = 0.0
@@ -608,9 +630,7 @@ class NLMS(BaseLMS):
     return y_hist, e_hist, w_hist
 
 
-# -----------------------------------------------------------------------------
 # Affine Projection (APA)
-# -----------------------------------------------------------------------------
 @dataclass
 class AffineProjection(BaseLMS):
   """
@@ -679,9 +699,8 @@ class OverLapSaveFDAF(BaseLMS):
   eps: float = 1e-8    # numerical safety
 
   def __post_init__(self):
+    self.fft_size = 2 * (self.filter_order + 1)
     super().__post_init__()
-
-    self.fft_size = 2 * self.n_coef
     self.Wf = np.zeros(self.fft_size, dtype=np.complex64)
 
     # initialize first M taps in frequency domain
@@ -690,6 +709,20 @@ class OverLapSaveFDAF(BaseLMS):
     self.Wf = np.fft.fft(w_time)
 
     self.pow_est = np.ones(self.fft_size, dtype=np.float32) * self.eps
+
+  @property
+  def w(self):
+    return np.fft.ifft(self.Wf).real[:self.n_coef]
+
+  @w.setter
+  def w(self, value):
+    value = np.asarray(value, dtype=np.complex64)
+    if value.shape != (self.n_coef,):
+      raise ValueError("Wrong shape")
+
+    w_time = np.zeros(self.fft_size, dtype=np.complex64)
+    w_time[:self.n_coef] = value
+    self.Wf = np.fft.fft(w_time)
 
   def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
 
@@ -740,7 +773,7 @@ class OverLapSaveFDAF(BaseLMS):
         e_pad = np.concatenate([np.zeros(M), e_block])
         Ef = np.fft.fft(e_pad)
 
-        # power normalization (NLMS-like)
+        # power normalization
         self.pow_est = (
           self.alpha * self.pow_est
           + (1 - self.alpha) * (np.abs(X) ** 2)
@@ -770,3 +803,128 @@ class OverLapSaveFDAF(BaseLMS):
       self.w = np.fft.ifft(self.Wf).real[:M]
 
     return y_hist, e_hist, w_hist
+
+@dataclass
+class SlidingDctLMS(BaseLMS):
+  beta: float = 0.99
+  gamma: float = 0.98
+  eps: float = 1e-8
+
+  def __post_init__(self):
+    super().__post_init__()
+
+    M = self.n_coef
+    self.m = np.arange(M, dtype=np.float64)
+
+    # Table 8.2: alpha = 1/(2M)
+    self.alpha = 1.0 / (2.0 * M)
+
+    # W_{2M} = exp(-j2π/(2M))
+    self.W2M = np.exp(-1j * 2.0 * np.pi / (2.0 * M))
+
+    # W_{2M}^m and W_{2M}^{-m}
+    self.Wm = self.W2M ** self.m
+    self.Wm_inv = np.conj(self.Wm)
+
+    # (-1)^m and k_m
+    self.sign = (-1.0) ** self.m
+    self.km = np.ones(M, dtype=np.float64)
+    self.km[0] = 1.0 / np.sqrt(2.0)
+
+    # States (Table 8.2 initialization)
+    self.A1 = np.zeros(M, dtype=np.complex128)
+    self.A2 = np.zeros(M, dtype=np.complex128)
+    self.lambda_hat = np.zeros(M, dtype=np.float64)
+
+    # delay line holds u(n-1)...u(n-M)
+    self.delay_line = np.zeros(M, dtype=np.float64)
+
+    # IMPORTANT: Table 8.2 uses real w_hat (DCT-domain weights)
+    self.w = np.zeros(M, dtype=np.float64)
+
+    self.n_iter = 1
+
+  def estR(self, x):
+    """Sample correlation"""
+    x = np.asarray(x)
+    return np.outer(x, x.conj())
+
+  def step(self, u: float, d: float | None = None, train: bool = True):
+    """
+    One-sample update of Table 8.2 DCT-LMS.
+    Returns: y, e, C  (C is the DCT-domain input vector)
+    """
+
+    M = self.n_coef
+    u = np.float64(u)
+
+    # sliding window delay
+    u_old = self.delay_line[-1]
+    self.delay_line[1:] = self.delay_line[:-1]
+    self.delay_line[0] = u
+
+    # sliding DCT innovation term: u(n) - beta^M (-1)^m u(n-M) 
+    innovation = u - (self.beta ** M) * self.sign * u_old   # vector over m
+
+    # Fig 8.6 / Table 8.2 recursions
+    self.A1 = self.beta * self.Wm     * self.A1 + innovation
+    self.A2 = self.beta * self.Wm_inv * self.A2 + self.Wm_inv * innovation
+
+    A = self.A1 + self.A2
+
+    # C_m(n)
+    C = 0.5 * self.km * self.sign * (self.W2M ** (self.m / 2.0)) * A
+    C = C.real
+
+    # filter output
+    y = float(np.dot(C, self.w))
+
+    if d is None:
+      # no training signal
+      self.n_iter += 1
+      return y, 0.0, C
+
+    d = np.float64(d)
+    e = float(d - y)
+
+    # eigenvalue estimation Eq (8.74)
+    self.lambda_hat = (
+      self.gamma * self.lambda_hat
+      + (1.0 / self.n_iter) * (C*C - self.gamma * self.lambda_hat)
+    )
+    self.lambda_hat = np.maximum(self.lambda_hat, self.eps)
+
+    # ---- weight update Table 8.2 ----
+    if train:
+      step_size = self.mu if self.mu is not None else self.alpha
+      self.w += (step_size / self.lambda_hat) * C * e
+
+    self.n_iter += 1
+    return y, e, C
+
+  def __call__(self, x, d=None, train=True):
+    """Run DCT-LMS over a sequence."""
+
+    x = np.asarray(x, dtype=np.float64)
+    N = len(x)
+
+    if d is not None:
+      d = np.asarray(d, dtype=np.float64)
+      if len(d) != N:
+        raise ValueError("x and d must have same length")
+
+    y_hist = np.zeros(N, dtype=np.float64)
+    e_hist = np.zeros(N, dtype=np.float64)
+    C_hist = np.zeros((N, self.n_coef), dtype=np.float64)
+
+    for n in range(N):
+      if d is None:
+        y, e, C = self.step(x[n], None, train=False)
+      else:
+        y, e, C = self.step(x[n], d[n], train=train)
+
+      y_hist[n] = y
+      e_hist[n] = e
+      C_hist[n] = C
+
+    return y_hist, e_hist, C_hist
