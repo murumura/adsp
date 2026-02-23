@@ -590,57 +590,87 @@ class PowerOfTwoErrorLMS(QuantizedLMS):
 
 @dataclass
 class LMSNewton(BaseLMS):
-  lam: float = 0.99    # forgetting factor ~ 1
-  delta: float = 1e-2  # P0 = (1/delta) I
-  eps: float = 1e-12
-  P: Array = field(init=False)
+  """
+  Complex LMS-Newton adaptive filter.
+  Implements the LMS-Newton algorithm as described in:
+  Diniz, Adaptive Filtering: Algorithms and Practical Implementation.
+  Update equations:
+      y(k) = w^H(k) x(k)
+      e(k) = d(k) - y(k)
+      p(k) = P(k) x(k)
+      phi(k) = x^H(k) p(k)
+      k(k) = p(k) / (alpha + phi(k))
+      w(k+1) = w(k) + 2 mu e*(k) p(k)
+      P(k+1) = ( P(k) - k(k) x^H(k) P(k) ) / alpha
+  where:
+      alpha ∈ (0, 1] is the forgetting factor
+      P(0) = (1/delta) I
+  """
+  alpha: float = 0.99           # forgetting factor (≈ 1)
+  delta: float = 1e-2           # P(0) = (1/delta) I
+  eps: float = 1e-12            # small numerical guard
+  R_hat_inv: Array = field(init=False)  # P(k)
 
   def __post_init__(self):
     super().__post_init__()
-    if not (0.0 < self.lam <= 1.0):
-      raise ValueError("lam must be in (0, 1].")
-    self.P = (1.0 / self.delta) * np.eye(self.n_coef, dtype=np.complex64)
+    if not (0.0 < self.alpha <= 1.0):
+      raise ValueError("alpha must satisfy 0 < alpha <= 1.")
+    # P(0) = (1/delta) I
+    self.R_hat_inv = (1.0 / self.delta) * np.eye(self.n_coef, dtype=np.complex64)
 
-  def __call__(self, x, d, train=True):
+  def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
     x = np.asarray(x)
     d = np.asarray(d)
     N = x.shape[0]
     x_pad = _prepad(x, self.n_coef)
     w = self.w.copy()
-    P = self.P.copy()
-    y_hist = np.empty((N,), np.complex64)
-    e_hist = np.empty((N,), np.complex64)
-    w_hist = np.empty((N+1, self.n_coef), np.complex64)
+    P = self.R_hat_inv.copy()
+    y_hist = np.empty((N,), dtype=np.complex64)
+    e_hist = np.empty((N,), dtype=np.complex64)
+    w_hist = np.empty((N + 1, self.n_coef), dtype=np.complex64)
     w_hist[0] = w
 
     for k in range(N):
-      reg = x_pad[k:k+self.n_coef][::-1].astype(np.complex64)
-      y = np.vdot(w, reg)
+      reg = x_pad[k : k + self.n_coef][::-1].astype(np.complex64)
+
+      y = np.vdot(w, reg)          # w^H x
       e = np.complex64(d[k]) - y
 
       if train:
         x_col = reg.reshape(-1, 1)
-        # gain vector
-        Px = P @ x_col
-        denom = (self.lam + (x_col.conj().T @ Px).item())
+
+        # p(k) = P(k) x(k)
+        p = P @ x_col
+
+        # phi(k) = x^H P x
+        phi = (x_col.conj().T @ p).item()
+
+        # denom = alpha + phi(k)
+        denom = self.alpha + phi
         if abs(denom) < self.eps:
-          denom = denom + (self.eps + 0j)
+          denom = denom + (self.eps + 0.0j)
 
-        # RLS-style P update
-        K = Px / denom
-        P = (P - K @ (x_col.conj().T @ P)) / self.lam
+        # k(k) = p(k) / denom
+        k_vec = p / denom
 
-        # Newton/LMS weight update uses preconditioned regressor
-        # (use updated P or equivalently use K-form; this is simple & consistent)
-        w = (w + (2.0 * self.mu) * np.conj(e) * (P @ x_col).ravel()).astype(np.complex64)
+        # Weight update (uses P(k))
+        # w(k+1) = w(k) + 2 mu e*(k) p(k)
+        w = (w + (2.0 * self.mu) * np.conj(e) * p.ravel()).astype(np.complex64)
+
+        # P update
+        # P(k+1) = (P(k) - k(k) x^H(k) P(k)) / alpha
+        P = (P - k_vec @ (x_col.conj().T @ P)) / self.alpha
+
+        # Optional: enforce Hermitian symmetry (numerical hygiene)
+        # P = 0.5 * (P + P.conj().T)
 
       y_hist[k] = y
       e_hist[k] = e
-      w_hist[k+1] = w
+      w_hist[k + 1] = w
 
     if train:
       self.w = w
-      self.P = P
+      self.R_hat_inv = P
 
     return y_hist, e_hist, w_hist
 
@@ -720,9 +750,6 @@ class TransformDomain(BaseLMS):
     return y_hist, e_hist, w_time_hist
 
 
-# -----------------------------------------------------------------------------
-# NLMS
-# -----------------------------------------------------------------------------
 @dataclass
 class NLMS(BaseLMS):
   """
@@ -764,7 +791,61 @@ class NLMS(BaseLMS):
     if train:
       self.w = w
     return y_hist, e_hist, w_hist
+  
+  def analyze(self, R: Array, verbose: bool = False) -> Dict[str, Any]:
+    tr = float(np.trace(R).real)
 
+    mu_n = float(self.mu)
+
+    # Stability condition
+    is_stable = (0.0 < mu_n < 2.0)
+
+    # Effective LMS-equivalent step size
+    mu_eff = mu_n / (2.0 * tr)
+
+    # Approx steady-state misadjustment
+    misadj = mu_n / 2.0
+
+    res = dict(
+      current_mu_n=mu_n,
+      tau=float(self.tau),
+      is_stable=is_stable,
+      effective_mu=float(mu_eff),
+      trace_R=float(tr),
+      theoretical_misadjustment=float(misadj),
+      upper_bound_mu_n=2.0,
+      suggested_conservative_mu_n=0.5,
+      suggested_aggressive_mu_n=1.0,
+    )
+
+    if verbose:
+      self.printMuAnalysisNLMS(res)
+
+    return res
+
+  def printMuAnalysisNLMS(self, a: Dict[str, Any]) -> None:
+    print("\n" + "=" * 60)
+    print("NLMS STEP SIZE ANALYSIS (Sec. 4.3)")
+    print("=" * 60)
+
+    print(f"mu_n: {a['current_mu_n']:.6f}")
+    print(f"tau:  {a['tau']:.6e}")
+    print(f"Stability: {'✓ STABLE' if a['is_stable'] else '✗ UNSTABLE'}")
+
+    print("\nEffective LMS-equivalent step size:")
+    print(f"  mu_eff ≈ mu_n / (2 tr[R]) = {a['effective_mu']:.6e}")
+
+    print("\nTheoretical steady-state misadjustment:")
+    print(f"  M ≈ mu_n / 2 = {a['theoretical_misadjustment']:.6f}")
+
+    print("\nStability Bound:")
+    print("  0 < mu_n < 2")
+
+    print("\nRecommended mu_n ranges:")
+    print(f"  Conservative: {a['suggested_conservative_mu_n']:.2f}")
+    print(f"  Aggressive:   {a['suggested_aggressive_mu_n']:.2f}")
+
+    print("=" * 60)
 
 # Affine Projection (APA)
 @dataclass
