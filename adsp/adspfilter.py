@@ -638,31 +638,15 @@ class LMSNewton(BaseLMS):
 
       if train:
         x_col = reg.reshape(-1, 1)
-
-        # p(k) = P(k) x(k)
+        # p = P x
         p = P @ x_col
-
-        # phi(k) = x^H P x
         phi = (x_col.conj().T @ p).item()
-
-        # denom = alpha + phi(k)
-        denom = self.alpha + phi
+        denom = ((1.0 - self.alpha) / self.alpha) + phi
         if abs(denom) < self.eps:
           denom = denom + (self.eps + 0.0j)
 
-        # k(k) = p(k) / denom
-        k_vec = p / denom
-
-        # Weight update (uses P(k))
-        # w(k+1) = w(k) + 2 mu e*(k) p(k)
-        w = (w + (2.0 * self.mu) * np.conj(e) * p.ravel()).astype(np.complex64)
-
-        # P update
-        # P(k+1) = (P(k) - k(k) x^H(k) P(k)) / alpha
-        P = (P - k_vec @ (x_col.conj().T @ P)) / self.alpha
-
-        # Optional: enforce Hermitian symmetry (numerical hygiene)
-        # P = 0.5 * (P + P.conj().T)
+        P = (P - (p @ p.conj().T) / denom) / (1.0 - self.alpha)
+        w = (w + 2.0 * self.mu * e * (P @ x_col).ravel()).astype(np.complex64)
 
       y_hist[k] = y
       e_hist[k] = e
@@ -749,6 +733,119 @@ class TransformDomain(BaseLMS):
 
     return y_hist, e_hist, w_time_hist
 
+@dataclass
+class NLMSController:
+  """
+  Variable Step-Size Controller for NLMS
+  ---------------------------------------
+  Diniz, Adaptive Filtering: Algorithms and Practical Implementation
+      Sec. 4.3 (Normalized LMS)
+      Variable step-size discussion
+
+  Theory
+  ------
+  Under Assumptions 1-3 (independence, small step-size,
+  and flat spectral input assumption), the optimal
+  normalized step size is:
+
+      u_opt(n) = E{|w_delta_u(n)|^2} / E{|e(n)|^2}
+
+  where
+      w_delta_u(n) = ε^H(n) u(n)  (noise-free a priori error)
+      e(n)   = w_delta_u(n) + v(n)
+
+  Since:
+      E{|e(n)|^2} = E{|w_delta_u(n)|^2} + sigma_n^2
+
+  We estimate:
+
+      w_delta_u^2 ≈ e_power - sigma_n^2
+
+  Therefore:
+
+      u_opt ≈ (e_power - sigma_n^2) / e_power
+
+  This matches Haykin Eq. (7.19) after applying
+  Assumptions 1-3.
+
+  Practical Notes
+  ---------------
+  • u_opt → 1 during initial convergence
+  • u_opt → 0 near steady state
+  • u_opt automatically adapts to SNR
+  • Must satisfy stability condition: 0 < u < 2
+  """
+
+  # Short-term power smoothing factors
+  # First-order recursive estimators:
+  #   u_power(n) = γ_u u_power(n-1) + (1-γ_u) ||u(n)||^2
+  #   e_power(n) = γ_e e_power(n-1) + (1-γ_e) |e(n)|^2
+  #
+  # (Haykin Sec. 7.4 practical implementation)
+  gamma_u: float = 0.95
+  gamma_e: float = 0.95
+
+  # Noise variance estimate sigma_n^2
+  # Can be obtained during silence periods (echo canceller practice)
+  sigma_v2: float = 0.0
+
+  # Upper bound to enforce NLMS stability (Haykin Eq. 7.18)
+  mu_max: float = 1.0
+
+  # Numerical safeguard
+  eps: float = 1e-12
+
+  # Internal state (running power estimates)
+  u_power: float = 0.0
+  e_power: float = 0.0
+
+  def update(self, reg: np.ndarray, e: complex) -> float:
+    """
+    Update short-term power estimates and compute adaptive μ.
+
+    Parameters
+    ----------
+    reg : ndarray
+        Regressor vector u(n)
+    e : complex
+        A priori error e(n)
+
+    Returns
+    -------
+    mu_opt : float
+        Adaptive normalized step size μ_n
+    """
+
+    # 1) Instantaneous power measurements
+    # ||u(n)||^2
+    u_inst = float(np.real(np.vdot(reg, reg)))
+
+    # |e(n)|^2
+    e_inst = float(np.abs(e)**2)
+
+    # 2) First-order exponential smoothing (MSD estimation approach)
+    self.u_power = (self.gamma_u * self.u_power + (1 - self.gamma_u) * u_inst)
+    self.e_power = (self.gamma_e * self.e_power + (1 - self.gamma_e) * e_inst)
+
+    # 3) Estimate noise-free error power
+    #    w_delta_u^2 ≈ e_power - sigma_n^2
+    #
+    # From:
+    #   E{|e|^2} = E{|w_delta_u|^2} + sigma_n^2
+    xi_u2 = max(self.e_power - self.sigma_v2, 0.0)
+
+    # 4) Haykin optimal u (Eq. 7.19 under assumptions)
+    #   u_opt = E{|w_delta_u|^2} / E{|e|^2}
+    if self.e_power > self.eps:
+      mu_opt = xi_u2 / self.e_power
+    else:
+      mu_opt = 0.0
+
+    # 5) Enforce stability bound
+    #    0 < u < 2  (Haykin Eq. 7.18)
+    mu_opt = min(max(mu_opt, 0.0), self.mu_max)
+
+    return mu_opt
 
 @dataclass
 class NLMS(BaseLMS):
@@ -759,6 +856,7 @@ class NLMS(BaseLMS):
   Here mu means mu_n (should satisfy 0 < mu_n < 2 for stability in the standard case).
   """
   tau: float = 1e-3
+  controller: NLMSController | None = None
 
   def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
     x = np.asarray(x)
@@ -777,11 +875,16 @@ class NLMS(BaseLMS):
       reg = x_pad[k:k + self.n_coef][::-1].astype(np.complex64)
       y = np.vdot(w, reg)
       e = np.complex64(d[k]) - y
-
-      norm = float(np.real(np.vdot(reg, reg)))  # ||reg||^2
-      mu_k = float(self.mu / (self.tau + norm))
-
+      
       if train:
+        # step size control
+        if self.controller is not None:
+          mu_n = self.controller.update(reg, e)
+        else:
+          mu_n = self.mu
+        norm = float(np.real(np.vdot(reg, reg)))
+        mu_k = mu_n / (self.tau + norm)
+
         w = (w + mu_k * np.conj(e) * reg).astype(np.complex64)
 
       y_hist[k] = y
@@ -792,30 +895,32 @@ class NLMS(BaseLMS):
       self.w = w
     return y_hist, e_hist, w_hist
   
-  def analyze(self, R: Array, verbose: bool = False) -> Dict[str, Any]:
+  def analyze(self, R: Array, verbose: bool = False):
+
     tr = float(np.trace(R).real)
 
-    mu_n = float(self.mu)
+    # If controller exists, μ is time-varying
+    if self.controller is not None:
+      mu_current = None
+      mu_bound = self.controller.mu_max
+    else:
+      mu_current = float(self.mu)
+      mu_bound = 2.0
 
-    # Stability condition
-    is_stable = (0.0 < mu_n < 2.0)
+    is_stable = True if mu_bound <= 2.0 else False
 
-    # Effective LMS-equivalent step size
-    mu_eff = mu_n / (2.0 * tr)
-
-    # Approx steady-state misadjustment
-    misadj = mu_n / 2.0
+    misadj_small_mu = None
+    if mu_current is not None:
+        misadj_small_mu = mu_current / 2.0
 
     res = dict(
-      current_mu_n=mu_n,
-      tau=float(self.tau),
-      is_stable=is_stable,
-      effective_mu=float(mu_eff),
-      trace_R=float(tr),
-      theoretical_misadjustment=float(misadj),
-      upper_bound_mu_n=2.0,
-      suggested_conservative_mu_n=0.5,
-      suggested_aggressive_mu_n=1.0,
+      tau=self.tau,
+      trace_R=tr,
+      controller_enabled=self.controller is not None,
+      stability_bound=2.0,
+      mu_current=mu_current,
+      mu_max=mu_bound,
+      theoretical_misadjustment=misadj_small_mu,
     )
 
     if verbose:
@@ -825,25 +930,40 @@ class NLMS(BaseLMS):
 
   def printMuAnalysisNLMS(self, a: Dict[str, Any]) -> None:
     print("\n" + "=" * 60)
-    print("NLMS STEP SIZE ANALYSIS (Sec. 4.3)")
+    print("NLMS STEP SIZE ANALYSIS (Haykin Ch.7 / Diniz Sec.4.3)")
     print("=" * 60)
 
-    print(f"mu_n: {a['current_mu_n']:.6f}")
-    print(f"tau:  {a['tau']:.6e}")
-    print(f"Stability: {'✓ STABLE' if a['is_stable'] else '✗ UNSTABLE'}")
+    print(f"tau: {a['tau']:.6e}")
+    print(f"trace[R]: {a['trace_R']:.6e}")
 
-    print("\nEffective LMS-equivalent step size:")
-    print(f"  mu_eff ≈ mu_n / (2 tr[R]) = {a['effective_mu']:.6e}")
+    print("\nStability Condition (Haykin Eq. 7.18):")
+    print("  0 < u(n) < 2")
 
-    print("\nTheoretical steady-state misadjustment:")
-    print(f"  M ≈ mu_n / 2 = {a['theoretical_misadjustment']:.6f}")
+    if a["controller_enabled"]:
+      print("\nStep-size Mode: VARIABLE (controller enabled)")
+      print(f"  u_max enforced: {a['mu_max']:.6f}")
+      print("  Stability guaranteed if mu_max < 2")
 
-    print("\nStability Bound:")
-    print("  0 < mu_n < 2")
+      if a["mu_current"] is not None:
+        print(f"  Current μ̃: {a['mu_current']:.6f}")
 
-    print("\nRecommended mu_n ranges:")
-    print(f"  Conservative: {a['suggested_conservative_mu_n']:.2f}")
-    print(f"  Aggressive:   {a['suggested_aggressive_mu_n']:.2f}")
+    else:
+      print("\nStep-size Mode: CONSTANT")
+
+      print(f"  u_n(mu_n): {a['mu_current']:.6f}")
+      print(f"  Stability: {'O STABLE' if a['mu_current'] < 2.0 else 'X UNSTABLE'}")
+
+      print("\nEffective LMS-equivalent step size:")
+      mu_eff = a['mu_current'] / (2.0 * a['trace_R'])
+      print(f"  u_eff ≈ u_opt/ (2 tr[R]) = {mu_eff:.6e}")
+
+      if a["theoretical_misadjustment"] is not None:
+        print("\nTheoretical steady-state misadjustment (small u):")
+        print(f"  M ≈ u_n / 2 = {a['theoretical_misadjustment']:.6f}")
+
+      print("\nRecommended u_n ranges (practical):")
+      print("  Conservative: 0.3-0.5")
+      print("  Aggressive:   0.7-1.0")
 
     print("=" * 60)
 
@@ -908,7 +1028,75 @@ class AffineProjection(BaseLMS):
     if train:
       self.w = w
     return y_hist, e_hist, w_hist
+  
+  def analyze(self, verbose=False):
+    """
+    Misadjustment based on Diniz Sec 4.6
 
+    Exact formula (4.124):
+      M = ((L+1)μ)/(2-μ) * (1-(1-μ)^2)/(1-(1-μ)^{2(L+1)})
+
+    Approximation (4.125):
+      M ≈ ((L+1)μ)/(2-μ)
+    """
+
+    mu = float(self.mu)
+    Lp = self.P + 1  # L+1
+
+    is_stable = (0.0 < mu < 2.0)
+
+    # Exact Eq (4.124)
+    num1 = (Lp * mu) / (2.0 - mu)
+    num2 = 1.0 - (1.0 - mu)**2
+    den2 = 1.0 - (1.0 - mu)**(2 * Lp)
+
+    if abs(den2) < 1e-12:
+        M_exact = np.nan
+    else:
+        M_exact = num1 * (num2 / den2)
+
+    # Approx Eq (4.125)
+    M_approx = (Lp * mu) / (2.0 - mu)
+
+    res = dict(
+        mu=mu,
+        projection_order=self.P,
+        projection_dimension=Lp,
+        is_stable=is_stable,
+        misadjustment_exact=M_exact,
+        misadjustment_approx=M_approx,
+        stability_bound_upper=2.0,
+    )
+
+    if verbose:
+        self.printAnalyzeAPA(res)
+
+    return res
+  
+  def printAnalyzeAPA(self, a):
+    print("\n" + "="*60)
+    print("AFFINE PROJECTION ANALYSIS (Diniz Sec 4.6)")
+    print("="*60)
+
+    print(f"Projection order P: {a['projection_order']}")
+    print(f"Projection dimension L+1: {a['projection_dimension']}")
+    print(f"mu: {a['mu']:.6f}")
+    print(f"Stability: {'✓ STABLE' if a['is_stable'] else '✗ UNSTABLE'}")
+
+    print("\nExact misadjustment (Eq. 4.124):")
+    print(f"  M = {a['misadjustment_exact']:.6f}")
+
+    print("\nLarge-L approximation (Eq. 4.125):")
+    print(f"  M ≈ {a['misadjustment_approx']:.6f}")
+
+    print("\nStability condition:")
+    print("  0 < μ < 2")
+
+    print("\nInterpretation:")
+    print("  • Increasing projection order increases steady-state error")
+    print("  • Faster convergence comes at cost of larger misadjustment")
+    print("="*60)
+    
 @dataclass
 class OverLapSaveFDAF(BaseLMS):
 
