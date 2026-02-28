@@ -260,7 +260,7 @@ class LMS(BaseLMS):
     print("LMS STEP SIZE ANALYSIS")
     print("=" * 60)
     print(f"Current mu: {a['current_mu']:.6f}")
-    print(f"Stability: {'✓ STABLE' if a['is_stable_R'] else '✗ UNSTABLE'}")
+    print(f"Stability: {'O STABLE' if a['is_stable_R'] else 'X UNSTABLE'}")
 
     print("\nEIGENVALUE ANALYSIS:")
     print(f"  Max eigenvalue (lambda_max): {a['lambda_max']:.6f}")
@@ -372,8 +372,8 @@ class QuantizedLMS(BaseLMS):
     print("\nBounds:")
     print(f"Mean bound (4.13): {a['mu_max_mean']:.6e}")
     print(f"MSE bound  (4.21): {a['mu_max_mse']:.6e}")
-    print(f"Mean stable: {'✓' if a['is_stable_mean'] else '✗'}")
-    print(f"MSE stable:  {'✓' if a['is_stable_mse'] else '✗'}")
+    print(f"Mean stable: {'O' if a['is_stable_mean'] else 'X'}")
+    print(f"MSE stable:  {'O' if a['is_stable_mse'] else 'X'}")
     print("\nMisadjustment (4.28):")
     print(f"M = {a['theoretical_misadjustment']:.6e}")
     print("=" * 60)
@@ -801,7 +801,7 @@ class NLMSController:
 
   def update(self, reg: np.ndarray, e: complex) -> float:
     """
-    Update short-term power estimates and compute adaptive μ.
+    Update short-term power estimates and compute adaptive u.
 
     Parameters
     ----------
@@ -899,7 +899,7 @@ class NLMS(BaseLMS):
 
     tr = float(np.trace(R).real)
 
-    # If controller exists, μ is time-varying
+    # If controller exists, u is time-varying
     if self.controller is not None:
       mu_current = None
       mu_bound = self.controller.mu_max
@@ -1034,10 +1034,10 @@ class AffineProjection(BaseLMS):
     Misadjustment based on Diniz Sec 4.6
 
     Exact formula (4.124):
-      M = ((L+1)μ)/(2-μ) * (1-(1-μ)^2)/(1-(1-μ)^{2(L+1)})
+      M = ((L+1)u)/(2-u) * (1-(1-u)^2)/(1-(1-u)^{2(L+1)})
 
     Approximation (4.125):
-      M ≈ ((L+1)μ)/(2-μ)
+      M ≈ ((L+1)u)/(2-u)
     """
 
     mu = float(self.mu)
@@ -1059,13 +1059,13 @@ class AffineProjection(BaseLMS):
     M_approx = (Lp * mu) / (2.0 - mu)
 
     res = dict(
-        mu=mu,
-        projection_order=self.P,
-        projection_dimension=Lp,
-        is_stable=is_stable,
-        misadjustment_exact=M_exact,
-        misadjustment_approx=M_approx,
-        stability_bound_upper=2.0,
+      mu=mu,
+      projection_order=self.P,
+      projection_dimension=Lp,
+      is_stable=is_stable,
+      misadjustment_exact=M_exact,
+      misadjustment_approx=M_approx,
+      stability_bound_upper=2.0,
     )
 
     if verbose:
@@ -1081,7 +1081,7 @@ class AffineProjection(BaseLMS):
     print(f"Projection order P: {a['projection_order']}")
     print(f"Projection dimension L+1: {a['projection_dimension']}")
     print(f"mu: {a['mu']:.6f}")
-    print(f"Stability: {'✓ STABLE' if a['is_stable'] else '✗ UNSTABLE'}")
+    print(f"Stability: {'O STABLE' if a['is_stable'] else 'X UNSTABLE'}")
 
     print("\nExact misadjustment (Eq. 4.124):")
     print(f"  M = {a['misadjustment_exact']:.6f}")
@@ -1090,7 +1090,7 @@ class AffineProjection(BaseLMS):
     print(f"  M ≈ {a['misadjustment_approx']:.6f}")
 
     print("\nStability condition:")
-    print("  0 < μ < 2")
+    print("  0 < u < 2")
 
     print("\nInterpretation:")
     print("  • Increasing projection order increases steady-state error")
