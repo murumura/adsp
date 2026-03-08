@@ -33,6 +33,45 @@ def csignvec(x: Array, eps: float = 1e-12) -> Array:
   out[nz] = x[nz] / mag[nz]
   return out
 
+def olsFFTConv(x, h, N, debug=False):
+  x = np.asarray(x, dtype=float)
+  h = np.asarray(h, dtype=float)
+
+  L = len(x)
+  M = len(h)
+
+  if N < M:
+    raise ValueError("FFT size must be >= filter length")
+
+  P = N - (M - 1)
+
+  if debug:
+    print(f"[OLS] L={L} M={M} N={N} P={P}")
+
+  # pad input with M-1 zeros at beginning
+  xpad = np.concatenate((np.zeros(M-1), x))
+
+  # FFT of filter
+  hpad = np.zeros(N)
+  hpad[:M] = h
+  H = np.fft.fft(hpad)
+
+  out = []
+
+  for start in range(0, len(x), P):
+    block = xpad[start:start + N]
+
+    if len(block) < N:
+      block = np.pad(block, (0, N - len(block)))
+
+    X = np.fft.fft(block)
+    Y = X * H
+    y = np.fft.ifft(Y).real
+
+    # discard corrupted samples
+    out.extend(y[M-1:])
+
+  return np.array(out[:L + M - 1])
 
 def csignscalar(e: Union[complex, Array], eps: float = 1e-12) -> np.complex64:
   """Complex sign scalar estimation."""
