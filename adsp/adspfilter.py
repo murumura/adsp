@@ -55,7 +55,7 @@ def olsFFTConv(x, h, N, debug=False):
   hpad = np.zeros(N)
   hpad[:M] = h
   H = np.fft.fft(hpad)
-
+  print(H)
   out = []
 
   for start in range(0, len(x), P):
