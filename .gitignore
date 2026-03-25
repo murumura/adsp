@@ -18,3 +18,4 @@ vivado.log
 ./fpga
 .ipynb_checkpoints/
 /lib/fft/sram_32x16_1rw/
+*.Identifier

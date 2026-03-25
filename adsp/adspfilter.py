@@ -1372,3 +1372,324 @@ class SlidingDctLMS(BaseLMS):
       C_hist[n] = C
 
     return y_hist, e_hist, C_hist
+
+
+def rlsMisadj2Lambda(M_desired: float, filter_order: int, K: float = 2.0,) -> float:
+  """
+  Solve for λ (forgetting factor) from desired RLS misadjustment using Diniz Example 5.3.
+
+  Uses:
+    a = (1 - λ) / (1 + λ)
+    M = (N+1) a (1 + 2 a K)
+
+  Args:
+    M_desired: desired misadjustment M
+    filter_order: adaptive filter order N
+    K: ratio term used in the textbook expression
+
+  Returns:
+    λ in (0, 1]
+  """
+
+  if M_desired <= 0:
+    raise ValueError("M_desired must be > 0")
+  if filter_order < 0:
+    raise ValueError("filter_order must be >= 0")
+  if K < 0:
+    raise ValueError("K must be >= 0")
+
+  L = filter_order + 1  # number of taps
+
+  # 2K a^2 + a - M/L = 0
+  c2 = 2.0 * K
+  c1 = 1.0
+  c0 = -M_desired / L
+
+  disc = c1 * c1 - 4.0 * c2 * c0
+  if disc < 0:
+    raise ValueError("No real solution for a")
+
+  sqrt_disc = np.sqrt(disc)
+
+  # physical valid root: a > 0
+  a1 = (-c1 + sqrt_disc) / (2.0 * c2)
+  a2 = (-c1 - sqrt_disc) / (2.0 * c2)
+
+  a = a1 if a1 > 0 else a2
+  if a <= 0:
+    raise ValueError("No positive solution for a")
+
+  lam = (1.0 - a) / (1.0 + a)
+
+  if not (0.0 < lam <= 1.0):
+    raise ValueError("Computed λ is out of valid range")
+
+  return float(lam)
+
+def rlsMisadj(lam: float, filter_order: int, K: float = 2.0,) -> float:
+  """
+  Compute RLS misadjustment:
+    M = (N+1) a (1 + 2 a K),
+    a = (1-λ)/(1+λ)
+  """
+  if not (0.0 < lam <= 1.0):
+    raise ValueError("lam must satisfy 0 < lam <= 1")
+  if filter_order < 0:
+    raise ValueError("filter_order must be >= 0")
+  if K < 0:
+    raise ValueError("K must be >= 0")
+
+  a = (1.0 - lam) / (1.0 + lam)
+  L = filter_order + 1
+  return float(L * a * (1.0 + 2.0 * a * K))
+
+def rlsMisadj2Ord(M_desired: float, lam: float, K: float = 2.0,) -> int:
+  """
+  Solve for filter order N from desired misadjustment:
+    M = (N+1) a (1 + 2 a K)
+  """
+  if M_desired <= 0:
+    raise ValueError("M_desired must be > 0")
+  if not (0.0 < lam <= 1.0):
+    raise ValueError("lam must satisfy 0 < lam <= 1")
+  if K < 0:
+    raise ValueError("K must be >= 0")
+
+  a = (1.0 - lam) / (1.0 + lam)
+  denom = a * (1.0 + 2.0 * a * K)
+  if denom <= 0:
+    raise ValueError("Invalid denominator")
+
+  N = M_desired / denom - 1.0
+  return int(np.round(N))
+
+@dataclass
+class RLS(BaseLMS):
+  """
+  Conventional Complex RLS (Diniz Algorithm 5.3)
+
+  Notation strictly follows textbook:
+
+    S_D(k) = R_D^{-1}(k)
+
+    k(k) = S_D(k-1)x(k) / (λ + x^H(k)S_D(k-1)x(k))
+
+    w(k) = w(k-1) + k(k)e*(k)
+
+    S_D(k) = (1/λ)[ S_D(k-1) - k(k)x^H(k)S_D(k-1) ]
+  """
+
+  lam: float = 0.99
+  delta: float = 1e-2
+  eps: float = 1e-12
+
+  S_D: Array = field(init=False)
+
+  def __post_init__(self):
+    # ignore mu since rls doesn't need it
+    self.mu = None
+    super().__post_init__()
+    self.S_D = (1.0 / self.delta) * np.eye(self.n_coef, dtype=np.complex64)
+
+  def __call__(self, x: Array, d: Array, train: bool = True):
+    x = np.asarray(x)
+    d = np.asarray(d)
+
+    N = x.shape[0]
+    x_pad = _prepad(x, self.n_coef)
+
+    w = self.w.copy()
+    S_D = self.S_D.copy()
+
+    y_hist = np.empty((N,), dtype=np.complex64)
+    e_hist = np.empty((N,), dtype=np.complex64)
+    w_hist = np.empty((N + 1, self.n_coef), dtype=np.complex64)
+    w_hist[0] = w
+
+    for k_idx in range(N):
+      xk = x_pad[k_idx:k_idx + self.n_coef][::-1].astype(np.complex64).reshape(-1,1)
+
+      # y(k) = w^H x(k)
+      y = np.vdot(w, xk.ravel())
+
+      # e(k)
+      e = np.complex64(d[k_idx]) - y
+
+      if train:
+        # k(k)
+        num = S_D @ xk
+        denom = self.lam + np.real((xk.conj().T @ num).item())
+        if abs(denom) < self.eps:
+          denom += self.eps
+
+        k_vec = num / denom
+
+        # w update
+        w = (w + k_vec.ravel() * np.conj(e)).astype(np.complex64)
+
+        # S_D update
+        S_D = (S_D - k_vec @ (xk.conj().T @ S_D)) / self.lam
+
+      y_hist[k_idx] = y
+      e_hist[k_idx] = e
+      w_hist[k_idx+1] = w
+
+    if train:
+      self.w = w
+      self.S_D = S_D
+
+    return y_hist, e_hist, w_hist
+  
+  def analyze(self, R: Optional[Array] = None, verbose: bool = False):
+    """
+    RLS analysis based on Diniz Chapter 5.
+
+    Key relations:
+      Stability: always stable if 0 < λ ≤ 1
+
+      Effective memory:
+        N_eff ≈ 1 / (1 - λ)
+
+      Misadjustment:
+        M ≈ (1 - λ)/2 * tr[R]
+
+    If R is not provided, only structural analysis is returned.
+    """
+
+    lam = float(self.lam)
+
+    is_stable = (0.0 < lam <= 1.0)
+
+    # ---- memory length ----
+    if lam < 1.0:
+      N_eff = 1.0 / (1.0 - lam)
+    else:
+      N_eff = float("inf")
+
+    # ---- misadjustment (needs R) ----
+    if R is not None:
+      tr = float(np.trace(R).real)
+      misadj = (1.0 - lam) / 2.0 * tr
+    else:
+      tr = None
+      misadj = None
+
+    # ---- conditioning of P ----
+    eigvals = np.linalg.eigvals(self.S_D)
+    cond_P = float(np.max(np.abs(eigvals)) / np.min(np.abs(eigvals)))
+
+    res = dict(
+      lambda_value=lam,
+      is_stable=is_stable,
+      effective_memory=float(N_eff),
+      trace_R=tr,
+      theoretical_misadjustment=misadj,
+      P_condition_number=cond_P,
+    )
+
+    if verbose:
+      self.printAnalyzeRLS(res)
+
+    return res
+  
+  def printAnalyzeRLS(self, a: Dict[str, Any]) -> None:
+    print("\n" + "=" * 60)
+    print("RLS ANALYSIS (Diniz Chapter 5)")
+    print("=" * 60)
+
+    print(f"Lambda (λ): {a['lambda_value']:.6f}")
+    print(f"Stability: {'O STABLE' if a['is_stable'] else 'X UNSTABLE'}")
+
+    print("\nMEMORY / TRACKING:")
+    print(f"  Effective memory length ≈ {a['effective_memory']:.2f} samples")
+
+    if a["effective_memory"] < 20:
+      print("  WARNING: Very short memory → noisy estimate")
+    elif a["effective_memory"] > 1000:
+      print("  WARNING: Very long memory → slow tracking")
+
+    if a["trace_R"] is not None:
+      print("\nSTEADY-STATE PERFORMANCE:")
+      print(f"  trace[R]: {a['trace_R']:.6f}")
+      print(f"  Misadjustment ≈ {(a['theoretical_misadjustment']):.6e}")
+    else:
+      print("\nSTEADY-STATE PERFORMANCE:")
+      print("  (R not provided → misadjustment unavailable)")
+
+    print("\nNUMERICAL CONDITIONING:")
+    print(f"  cond(P): {a['P_condition_number']:.2e}")
+
+    if a["P_condition_number"] > 1e6:
+      print("  WARNING: P is ill-conditioned → numerical instability risk")
+
+    print("\nDESIGN INSIGHT:")
+    print("  • λ → 1     → low misadjustment, slow tracking")
+    print("  • λ smaller → fast tracking, higher noise")
+    print("  • Effective memory ≈ 1/(1-λ)")
+
+    print("=" * 60)
+
+@dataclass
+class RLSAlt(BaseLMS):
+  """
+  Alternative Complex RLS (Diniz Algorithm 5.4)
+
+    e(k) = d(k) - w^H(k-1)x(k)
+
+    ψ(k) = S_D(k-1)x(k)
+
+    S_D(k) = (1/λ)[ S_D(k-1)
+              - ψ(k)ψ^H(k)/(λ + ψ^H(k)x(k)) ]
+
+    w(k) = w(k-1) + e*(k) S_D(k)x(k)
+  """
+
+  lam: float = 0.99
+  delta: float = 1e-2
+  eps: float = 1e-12
+
+  S_D: Array = field(init=False)
+
+  def __post_init__(self):
+    super().__post_init__()
+    self.S_D = (1.0 / self.delta) * np.eye(self.n_coef, dtype=np.complex64)
+
+  def __call__(self, x: Array, d: Array, train: bool = True):
+    x = np.asarray(x)
+    d = np.asarray(d)
+
+    N = x.shape[0]
+    x_pad = _prepad(x, self.n_coef)
+
+    w = self.w.copy()
+    S_D = self.S_D.copy()
+
+    y_hist = np.empty((N,), dtype=np.complex64)
+    e_hist = np.empty((N,), dtype=np.complex64)
+    w_hist = np.empty((N + 1, self.n_coef), dtype=np.complex64)
+    w_hist[0] = w
+
+    for k_idx in range(N):
+      xk = x_pad[k_idx:k_idx + self.n_coef][::-1].astype(np.complex64).reshape(-1,1)
+
+      y = np.vdot(w, xk.ravel())
+
+      e = np.complex64(d[k_idx]) - y
+      if train:
+        # ψ(k)
+        psi = S_D @ xk
+        denom = self.lam + (psi.conj().T @ xk).item()
+        if abs(denom) < self.eps:
+          denom += self.eps
+        S_D = (S_D - (psi @ psi.conj().T) / denom) / self.lam
+        w = (w + np.conj(e) * (S_D @ xk).ravel()).astype(np.complex64)
+
+      y_hist[k_idx] = y
+      e_hist[k_idx] = e
+      w_hist[k_idx+1] = w
+
+    if train:
+      self.w = w
+      self.S_D = S_D
+
+    return y_hist, e_hist, w_hist
