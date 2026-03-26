@@ -1478,7 +1478,7 @@ class RLS(BaseLMS):
 
     S_D(k) = (1/λ)[ S_D(k-1) - k(k)x^H(k)S_D(k-1) ]
   """
-
+  mu = None
   lam: float = 0.99
   delta: float = 1e-2
   eps: float = 1e-12
@@ -1643,7 +1643,7 @@ class RLSAlt(BaseLMS):
 
     w(k) = w(k-1) + e*(k) S_D(k)x(k)
   """
-
+  mu = None
   lam: float = 0.99
   delta: float = 1e-2
   eps: float = 1e-12
