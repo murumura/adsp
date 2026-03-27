@@ -189,16 +189,20 @@ def dftUnitaryMatrix(M: int, dtype=np.complex64) -> Array:
 
 
 def _prepad(x: Array, n_coef: int) -> Array:
-  return np.concatenate([np.zeros(n_coef - 1, dtype=x.dtype), x])
-
+  """
+  Ensures input is flattened and prepended with zeros.
+  The result is always a 1D array of length (len(x) + n_coef - 1).
+  """
+  x_flat = np.asarray(x).ravel()
+  return np.concatenate([np.zeros(n_coef - 1, dtype=x_flat.dtype), x_flat])
 
 # -----------------------------------------------------------------------------
 # Base
 # -----------------------------------------------------------------------------
 @dataclass
 class BaseLMS:
-  mu: float | None
   filter_order: int
+  mu: Optional[float] = None  # Default to None for non-LMS types
   init_coef: Optional[Array] = None
   w: Array = field(init=False)
 
@@ -1108,7 +1112,7 @@ class AffineProjection(BaseLMS):
     )
 
     if verbose:
-        self.printAnalyzeAPA(res)
+      self.printAnalyzeAPA(res)
 
     return res
   
@@ -1633,14 +1637,9 @@ class RLS(BaseLMS):
 class RLSAlt(BaseLMS):
   """
   Alternative Complex RLS (Diniz Algorithm 5.4)
-
     e(k) = d(k) - w^H(k-1)x(k)
-
     ψ(k) = S_D(k-1)x(k)
-
-    S_D(k) = (1/λ)[ S_D(k-1)
-              - ψ(k)ψ^H(k)/(λ + ψ^H(k)x(k)) ]
-
+    S_D(k) = (1/λ)[ S_D(k-1) - ψ(k)ψ^H(k)/(λ + ψ^H(k)x(k)) ]
     w(k) = w(k-1) + e*(k) S_D(k)x(k)
   """
   mu = None
