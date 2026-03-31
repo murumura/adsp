@@ -31,7 +31,7 @@ class BaseDfe:
     idx = np.abs(self.constellation - y).argmin()
     return self.constellation[idx]
 
-  def getRegressor(self, new_u: complex) -> np.ndarray:
+  def makeRegressor(self, new_u: complex) -> np.ndarray:
     """Update FF buffer and return the concatenated [u_vec; d_hat_vec]."""
     # Shift and insert new sample into Feedforward buffer
     self.ff_buf[1:] = self.ff_buf[:-1]
@@ -81,12 +81,11 @@ class RlsDfe(BaseDfe):
     y_hist = np.zeros(N, dtype=np.complex64)
     e_hist = np.zeros(N, dtype=np.complex64)
     
-    # Clear buffers for new signal sequence
-    self.resetAllStates()
+    self.resetStates()
     
     for k in range(N):
-      # 1. Get the hybrid regressor x(k)
-      xk = self.getRegressor(u[k])
+      # Get the hybrid regressor x(k)
+      xk = self.makeRegressor(u[k])
       
       yk, ek, _ = self.rls_engine(
         xk.reshape(1, -1),
@@ -96,16 +95,15 @@ class RlsDfe(BaseDfe):
       
       y_hist[k] = yk[0]
       e_hist[k] = ek[0]
-      
-      # 3. Update feedback logic
+
       self.updateFeedback(y_hist[k], d[k], training_mode=train)
     
     return y_hist, e_hist
 
-  def resetAllStates(self):
+  def resetStates(self):
     """Resets both the DFE buffers and the RLS weights/P-matrix."""
     self.resetBuffers()
-    # Direct reset of RLS class members
+    # reset of RLS class members
     self.rls_engine.w[:] = 0
     self.rls_engine.S_D = (1.0 / self.delta) * np.eye(self.n_taps, dtype=np.complex64)
 
