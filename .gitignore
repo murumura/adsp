@@ -19,3 +19,4 @@ vivado.log
 .ipynb_checkpoints/
 /lib/fft/sram_32x16_1rw/
 *.Identifier
+*Zone.Identifier
