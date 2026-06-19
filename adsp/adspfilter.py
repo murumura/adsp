@@ -1,9 +1,10 @@
 import numpy as np
+import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple, Union, Literal
+from typing import Any, Dict, Optional, Tuple, Union, Literal, TypeAlias
 from . import adspquant
 
-Array = Union[np.ndarray]
+Array: TypeAlias = np.ndarray
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -1308,12 +1309,16 @@ class AffineProjection(BaseLMS):
       for i in range(Pp):
         kk = k - i
         # reverse to get [x(k-i), x(k-i-1), ..., x(k-i-M+1)]
-        reg = x_pad[kk:kk + M][::-1].astype(np.complex64)
+        if kk < 0:
+          # pad zero for current time < 0 for aligning
+          reg = np.zeros((M,), dtype=np.complex64)
+        else:
+          reg = x_pad[kk:kk + M][::-1].astype(np.complex64)
         cols.append(reg)
 
       Xap = np.stack(cols, axis=1)  # (M, P+1)
-      d_ap = np.array([d[k - i] for i in range(Pp)], dtype=np.complex64)  # (P+1,)
-
+      
+      d_ap = np.array([d[k - i] if (k - i) >= 0 else 0.0 for i in range(Pp)], dtype=np.complex64)
       # Diniz complex notation: y_ap = X_ap^T w*
       y_ap = Xap.T @ np.conj(w)     # (P+1,)
       e_ap = d_ap - y_ap            # (P+1,)
@@ -1712,12 +1717,6 @@ def rlsMisadj2Ord(M_desired: float, lam: float, K: float = 2.0,) -> int:
 
   N = M_desired / denom - 1.0
   return int(np.round(N))
-
-import numpy as np
-
-
-import numpy as np
-
 
 def rlsSnrInitParams(
     snr_db: float,
@@ -2261,390 +2260,6 @@ class QuantizedRLSAlt(BaseLMS):
 
     print("=" * 60)
 
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any
-
-import math
-import numpy as np
-
-Array = np.ndarray
-
-
-# ============================================================
-# Generic SM helper functions
-# ============================================================
-
-def qFunc(x: float) -> float:
-  """Gaussian Q-function: Q(x) = P[Z > x], Z ~ N(0, 1)."""
-  return 0.5 * math.erfc(float(x) / math.sqrt(2.0))
-
-
-def calcSmGammaBar(
-  noise_var: float,
-  gamma_scale: float = math.sqrt(5.0),
-) -> float:
-  """
-  Practical SM error bound:
-    gamma_bar = gamma_scale * sigma_n
-              = gamma_scale * sqrt(noise_var)
-  """
-  if noise_var < 0.0:
-    raise ValueError(f"noise_var must be non-negative, got {noise_var}.")
-
-  return float(gamma_scale * math.sqrt(noise_var))
-
-
-def estimateSmUpdateRateBounds(
-  gamma_bar: float,
-  noise_var: float,
-) -> Dict[str, float]:
-  """
-  Appendix-D style rough bounds:
-
-    lower = 2 Q(gamma_bar / sigma_n)
-
-    upper = 2 Q(gamma_bar / sqrt(2 sigma_n^2 + gamma_bar^2))
-  """
-  if gamma_bar < 0.0:
-    raise ValueError(f"gamma_bar must be non-negative, got {gamma_bar}.")
-
-  if noise_var <= 0.0:
-    raise ValueError(f"noise_var must be positive, got {noise_var}.")
-
-  sigma_n = math.sqrt(noise_var)
-
-  lower = 2.0 * qFunc(gamma_bar / sigma_n)
-
-  upper_den = math.sqrt(2.0 * noise_var + gamma_bar * gamma_bar)
-  upper = 2.0 * qFunc(gamma_bar / upper_den)
-
-  return dict(
-    sigma_n=float(sigma_n),
-    gamma_bar=float(gamma_bar),
-    gamma_scale=float(gamma_bar / sigma_n),
-    update_rate_lower_bound=float(lower),
-    update_rate_upper_bound=float(upper),
-  )
-
-
-def estimateSmUpdateRateGaussian(
-  gamma_bar: float,
-  error_var: float,
-) -> float:
-  """
-  Gaussian estimate:
-    p_up ~= 2 Q(gamma_bar / sigma_e)
-  """
-  if gamma_bar < 0.0:
-    raise ValueError(f"gamma_bar must be non-negative, got {gamma_bar}.")
-
-  if error_var <= 0.0:
-    raise ValueError(f"error_var must be positive, got {error_var}.")
-
-  sigma_e = math.sqrt(error_var)
-  return float(2.0 * qFunc(gamma_bar / sigma_e))
-
-
-def measureSmUpdateRateFromErrors(
-  e: Array,
-  gamma_bar: float,
-) -> float:
-  """
-  Measured SM update rate from an error sequence.
-
-    update if |e(k)| > gamma_bar
-  """
-  e = np.asarray(e)
-
-  if e.size == 0:
-    return 0.0
-
-  if gamma_bar < 0.0:
-    raise ValueError(f"gamma_bar must be non-negative, got {gamma_bar}.")
-
-  return float(np.mean(np.abs(e) > gamma_bar))
-
-
-def analyzeSmGammaBar(
-  noise_var: float,
-  gamma_bar: Optional[float] = None,
-  gamma_scale: float = math.sqrt(5.0),
-  e: Optional[Array] = None,
-  name: str = "SM algorithm",
-  verbose: bool = True,
-) -> Dict[str, Any]:
-  """
-  Analyze gamma_bar choice for SM-NLMS / SM-AP / SM-BNLMS.
-
-  If gamma_bar is None:
-    gamma_bar = gamma_scale * sqrt(noise_var)
-
-  If e is given:
-    also estimate empirical update rate.
-  """
-  if noise_var <= 0.0:
-    raise ValueError(f"noise_var must be positive, got {noise_var}.")
-
-  sigma_n = math.sqrt(noise_var)
-
-  if gamma_bar is None:
-    gamma_bar = calcSmGammaBar(noise_var, gamma_scale=gamma_scale)
-
-  bounds = estimateSmUpdateRateBounds(
-    gamma_bar=gamma_bar,
-    noise_var=noise_var,
-  )
-
-  res: Dict[str, Any] = dict(
-    name=name,
-    noise_var=float(noise_var),
-    sigma_n=float(sigma_n),
-    gamma_bar=float(gamma_bar),
-    gamma_scale=float(gamma_bar / sigma_n),
-    update_rate_lower_bound=bounds["update_rate_lower_bound"],
-    update_rate_upper_bound=bounds["update_rate_upper_bound"],
-  )
-
-  if e is not None:
-    e_arr = np.asarray(e)
-    error_var = float(np.mean(np.abs(e_arr) ** 2))
-
-    res.update(
-      measured_update_rate=measureSmUpdateRateFromErrors(e_arr, gamma_bar),
-      error_var=error_var,
-      sigma_e=float(math.sqrt(error_var)),
-      gaussian_update_rate_est=estimateSmUpdateRateGaussian(
-        gamma_bar=gamma_bar,
-        error_var=error_var,
-      ),
-    )
-
-  if verbose:
-    printSmGammaAnalysis(res)
-
-  return res
-
-
-def printSmGammaAnalysis(a: Dict[str, Any]) -> None:
-  print("\n" + "=" * 72)
-  print("SET-MEMBERSHIP GAMMA_BAR ANALYSIS")
-  print("=" * 72)
-  print(f"Algorithm:        {a['name']}")
-  print(f"noise_var:        {a['noise_var']:.6g}")
-  print(f"sigma_n:          {a['sigma_n']:.6g}")
-  print(f"gamma_bar:        {a['gamma_bar']:.6g}")
-  print(f"gamma_scale:      {a['gamma_scale']:.6g} * sigma_n")
-
-  print("\nAnalytical update-rate bounds:")
-  print(f"  lower bound:    {a['update_rate_lower_bound']:.6f}")
-  print(f"  upper bound:    {a['update_rate_upper_bound']:.6f}")
-
-  if "measured_update_rate" in a:
-    print("\nMeasured / empirical:")
-    print(f"  error_var:      {a['error_var']:.6g}")
-    print(f"  sigma_e:        {a['sigma_e']:.6g}")
-    print(f"  measured p_up:  {a['measured_update_rate']:.6f}")
-    print(f"  Gaussian p_up:  {a['gaussian_update_rate_est']:.6f}")
-
-  print("=" * 72)
-
-
-def calcSmGammaBarFromXi(
-  xi: float,
-  gamma_scale: float = math.sqrt(5.0),
-) -> float:
-  """
-  gamma_bar from minimum achievable MSE xi:
-
-    gamma_bar = gamma_scale * sqrt(xi)
-  """
-  if xi < 0.0:
-    raise ValueError(f"xi must be non-negative, got {xi}.")
-
-  return float(gamma_scale * math.sqrt(xi))
-
-
-def calcXiFromUndermodeling(
-  h: Array,
-  filter_order: int,
-  sigma_x2: float = 1.0,
-  sigma_n2: float = 0.0,
-) -> Dict[str, float]:
-  """
-  xi = sigma_x^2 * sum_{i=N+1}^{inf} h^2(i) + sigma_n^2
-
-  filter_order = N, so adaptive filter has N+1 taps.
-  """
-  h = np.asarray(h)
-
-  if filter_order < 0:
-    raise ValueError(f"filter_order must be non-negative, got {filter_order}.")
-
-  n_coef = filter_order + 1
-
-  if n_coef >= len(h):
-    tail_energy = 0.0
-  else:
-    tail_energy = float(np.sum(np.abs(h[n_coef:]) ** 2))
-
-  xi = float(sigma_x2 * tail_energy + sigma_n2)
-
-  return dict(
-    filter_order=int(filter_order),
-    n_coef=int(n_coef),
-    sigma_x2=float(sigma_x2),
-    sigma_n2=float(sigma_n2),
-    tail_energy=float(tail_energy),
-    xi=float(xi),
-  )
-
-
-def analyzeSmGammaBarFromUndermodeling(
-  h: Array,
-  filter_order: int,
-  sigma_x2: float = 1.0,
-  sigma_n2: float = 0.0,
-  gamma_scale: float = math.sqrt(5.0),
-  verbose: bool = True,
-) -> Dict[str, Any]:
-  info = calcXiFromUndermodeling(
-    h=h,
-    filter_order=filter_order,
-    sigma_x2=sigma_x2,
-    sigma_n2=sigma_n2,
-  )
-
-  gamma_bar = calcSmGammaBarFromXi(
-    xi=info["xi"],
-    gamma_scale=gamma_scale,
-  )
-
-  info["gamma_scale"] = float(gamma_scale)
-  info["gamma_bar"] = float(gamma_bar)
-
-  if verbose:
-    print("\n" + "=" * 72)
-    print("SM GAMMA_BAR FROM UNDERMODELING ANALYSIS")
-    print("=" * 72)
-    print(f"filter_order:  {info['filter_order']}")
-    print(f"n_coef:        {info['n_coef']}")
-    print(f"sigma_x2:      {info['sigma_x2']:.6g}")
-    print(f"sigma_n2:      {info['sigma_n2']:.6g}")
-    print(f"tail_energy:   {info['tail_energy']:.6g}")
-    print(f"xi:            {info['xi']:.6g}")
-    print(f"gamma_scale:   {info['gamma_scale']:.6g}")
-    print(f"gamma_bar:     {info['gamma_bar']:.6g}")
-    print("=" * 72)
-
-  return info
-
-
-# ============================================================
-# Partial-update helper functions
-# ============================================================
-
-def selectPartialUpdateMask(
-  x_reg: Array,
-  mu_sm: float,
-  max_update: int,
-  eps: float = 1e-12,
-) -> Tuple[Array, Array, float, float, bool]:
-  """
-  Select largest-energy coefficients until:
-
-    ||C x||^2 >= mu_sm ||x||^2
-
-  or until max_update coefficients are selected.
-
-  Returns:
-    mask
-    selected_idx
-    selected_norm
-    full_norm
-    reached_bound
-  """
-  x_reg = np.asarray(x_reg)
-
-  if x_reg.ndim != 1:
-    raise ValueError(f"x_reg must be 1-D, got shape {x_reg.shape}.")
-
-  n_coef = x_reg.shape[0]
-
-  if max_update <= 0:
-    raise ValueError(f"max_update must be positive, got {max_update}.")
-
-  max_update = min(int(max_update), n_coef)
-
-  power = np.abs(x_reg) ** 2
-  full_norm = float(np.sum(power))
-
-  if full_norm <= eps:
-    mask = np.zeros((n_coef,), dtype=np.float32)
-    return mask, np.array([], dtype=np.int64), 0.0, full_norm, False
-
-  order = np.argsort(power)[::-1]
-  target = float(mu_sm * full_norm)
-
-  selected_power = 0.0
-  selected = []
-
-  for idx in order[:max_update]:
-    selected.append(int(idx))
-    selected_power += float(power[idx])
-
-    if selected_power >= target:
-      break
-
-  selected_idx = np.asarray(selected, dtype=np.int64)
-
-  mask = np.zeros((n_coef,), dtype=np.float32)
-  mask[selected_idx] = 1.0
-
-  reached_bound = bool(selected_power >= target)
-
-  return mask, selected_idx, float(selected_power), full_norm, reached_bound
-
-
-def calcTemporaryGammaBar(
-  e: complex,
-  selected_norm: float,
-  full_norm: float,
-  eps: float = 1e-12,
-) -> float:
-  """
-  Eq. 6.77:
-
-    gamma_bar(k) =
-      (||x||^2 - ||C x||^2) / ||x||^2 * |e(k)|
-  """
-  if full_norm <= eps:
-    return float(np.abs(e))
-
-  ratio = (full_norm - selected_norm) / full_norm
-  ratio = max(0.0, min(1.0, float(ratio)))
-
-  return float(ratio * np.abs(e))
-
-
-def calcEffectiveSmStep(
-  e: complex,
-  gamma_bar: float,
-  eps: float = 1e-12,
-) -> float:
-  """
-  mu(k) = 1 - gamma_bar / |e(k)|, if |e(k)| > gamma_bar.
-  """
-  abs_e = float(np.abs(e))
-
-  if abs_e <= gamma_bar:
-    return 0.0
-
-  return float(1.0 - gamma_bar / max(abs_e, eps))
-
-
-# ============================================================
-# SMPNLMS
-# ============================================================
 
 @dataclass
 class SMPNLMS(BaseLMS):
@@ -2672,6 +2287,7 @@ class SMPNLMS(BaseLMS):
 
   update_flags: Array = field(init=False, repr=False)
   mu_hist: Array = field(init=False, repr=False)
+  delta: float = 1e-2
 
   def __post_init__(self):
     super().__post_init__()
@@ -2720,7 +2336,7 @@ class SMPNLMS(BaseLMS):
 
         if norm_x > self.eps:
           mu_sm = 1.0 - self.gamma_bar / max(abs_e, self.eps)
-          w = (w + mu_sm * np.conj(e) * reg / norm_x).astype(np.complex64)
+          w = (w + mu_sm * np.conj(e) * reg / (norm_x + self.delta)).astype(np.complex64)
 
           update_flags[k] = True
           mu_hist[k] = np.float32(mu_sm)
@@ -2991,7 +2607,7 @@ class SMBNLMS(BaseLMS):
 
   gamma_bar: float = 0.0
   eps: float = 1e-12
-  delta: float = 0.0
+  delta: float = 1e-2
   algorithm: int = 2
   init_coef: Optional[Array] = None
   mu: Optional[float] = None
@@ -3004,7 +2620,8 @@ class SMBNLMS(BaseLMS):
 
   def __post_init__(self):
     super().__post_init__()
-
+    if self.mu is None:
+      self.mu = 1.0
     if self.gamma_bar < 0.0:
       raise ValueError(f"gamma_bar must be non-negative, got {self.gamma_bar}.")
 
@@ -3103,7 +2720,7 @@ class SMBNLMS(BaseLMS):
     if norm_cur <= self.eps:
       return w, False, False, True, 0.0, 0.0
 
-    mu1 = 1.0 - self.gamma_bar / max(abs_e, self.eps)
+    mu1 = self.mu * (1.0 - self.gamma_bar / max(abs_e, self.eps))
 
     w_hat = (w + mu1 * np.conj(e) * x_cur / (norm_cur + self.delta)).astype(np.complex64)
 
@@ -3132,17 +2749,17 @@ class SMBNLMS(BaseLMS):
     if norm_perp <= self.eps:
       return w_hat, did_update, did_correct, True, mu1, mu2
 
-    mu2 = 1.0 - self.gamma_bar / max(abs_eps_prev, self.eps)
+    mu2 = self.mu * (1.0 - self.gamma_bar / max(abs_eps_prev, self.eps))
 
     w_new = (w_hat + mu2 * np.conj(eps_prev) * x_prev_perp / (norm_perp + self.delta)).astype(np.complex64)
-
     did_correct = True
 
     return w_new, did_update, did_correct, is_singular, mu1, mu2
 
   def updateAlg2(self, w, x_pad, k, x_cur, e):
     abs_e = float(np.abs(e))
-    mu1 = 1.0 - self.gamma_bar / max(abs_e, self.eps)
+    
+    mu1 = self.mu * (1.0 - self.gamma_bar / max(abs_e, self.eps))
 
     if k == 0:
       return self.updateSmnlmsFallback(
@@ -3157,9 +2774,9 @@ class SMBNLMS(BaseLMS):
 
     A = float(np.vdot(x_cur, x_cur).real)
     B = float(np.vdot(x_prev, x_prev).real)
-    C = np.vdot(x_prev, x_cur)
+    c_cur_prev = np.vdot(x_cur, x_prev)
 
-    D = A * B - float(np.abs(C) ** 2)
+    D = A * B - float(np.abs(c_cur_prev) ** 2)
 
     if A <= self.eps or B <= self.eps or D <= self.eps:
       return self.updateSmnlmsFallback(
@@ -3170,8 +2787,7 @@ class SMBNLMS(BaseLMS):
         is_singular=True,
       )
 
-    q = (B * x_cur - C * x_prev) / (D + self.delta)
-
+    q = (B * x_cur - np.conj(c_cur_prev) * x_prev) / (D + self.delta)
     w_new = (w + mu1 * np.conj(e) * q).astype(np.complex64)
 
     return w_new, True, False, False, mu1, 0.0
@@ -3299,3 +2915,317 @@ class SMBNLMS(BaseLMS):
     print(f"Max mu_sm:                 {a['max_mu_sm']:.6f}")
     print(f"Mean mu2_sm:               {a['mean_mu2_sm']:.6f}")
     print("=" * 60)
+
+
+@dataclass
+class SMPartialUpdateAffineProjection(BaseLMS):
+  """
+  Faithful Diniz-style Simplified SM-PUAP.
+
+  This follows Simp_SM_PUAP / Algorithm 6.6 style.
+
+  Textbook update:
+
+    w(k+1) = w(k)
+           + C(k) Xap(k)
+             [Xap^H(k) C(k) Xap(k) + gamma I]^{-1}
+             mu(k) e*(k) u1
+
+  where:
+
+    mu(k) = 1 - gamma_bar / |e(k)|, if |e(k)| > gamma_bar
+          = 0, otherwise
+
+  P:
+    memory length L in the textbook.
+
+  max_update:
+    Mbar. Used when selector_mode="topEnergy".
+
+  selector_mode:
+    "topEnergy":
+      Section 6.9.2 style. Select Mbar rows of Xap with largest row energy.
+
+    "random":
+      MATLAB demo style. Random 0/1 selector at each iteration.
+
+    "external":
+      Use up_selector[:, k] exactly.
+
+  up_selector:
+    Optional selector matrix with shape (n_coef, n_iterations).
+    Each column is the 0/1 coefficient update selector C(k).
+  """
+
+  P: int = 3
+  gamma_bar: float = 0.0
+  max_update: int = 5
+  delta: float = 1e-3
+  eps: float = 1e-12
+  mu: Optional[float] = None
+
+  selector_mode: str = "topEnergy"
+  up_selector: Optional[Array] = None
+
+  update_flags: Array = field(init=False, repr=False)
+  selected_mask_hist: Array = field(init=False, repr=False)
+  selected_count_hist: Array = field(init=False, repr=False)
+  mu_sm_hist: Array = field(init=False, repr=False)
+  post_e_hist: Array = field(init=False, repr=False)
+
+  def __post_init__(self):
+    super().__post_init__()
+
+    if self.P < 0:
+      raise ValueError(f"P must be non-negative, got {self.P}.")
+
+    if self.gamma_bar < 0.0:
+      raise ValueError(f"gamma_bar must be non-negative, got {self.gamma_bar}.")
+
+    if self.max_update <= 0:
+      raise ValueError(f"max_update must be positive, got {self.max_update}.")
+
+    if self.delta < 0.0:
+      raise ValueError(f"delta must be non-negative, got {self.delta}.")
+
+    if self.eps <= 0.0:
+      raise ValueError(f"eps must be positive, got {self.eps}.")
+
+    if self.selector_mode not in ("topEnergy", "random", "external"):
+      raise ValueError(
+        "selector_mode must be 'topEnergy', 'random', or 'external', "
+        f"got {self.selector_mode}."
+      )
+
+  def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
+    x = np.asarray(x, dtype=np.complex128)
+    d = np.asarray(d, dtype=np.complex128)
+
+    if x.ndim != 1:
+      raise ValueError(f"x must be 1-D, got shape {x.shape}.")
+
+    if d.ndim != 1:
+      raise ValueError(f"d must be 1-D, got shape {d.shape}.")
+
+    if x.shape[0] != d.shape[0]:
+      raise ValueError(f"x and d must have same length, got {x.shape[0]} and {d.shape[0]}.")
+
+    K = x.shape[0]
+    N = self.n_coef
+    L = self.P
+    Pp = L + 1
+
+    if self.max_update > N:
+      raise ValueError(f"max_update={self.max_update} cannot exceed n_coef={N}.")
+
+    if self.selector_mode == "external":
+      if self.up_selector is None:
+        raise ValueError("up_selector must be provided when selector_mode='external'.")
+
+      self.up_selector = np.asarray(self.up_selector)
+
+      if self.up_selector.shape != (N, K):
+        raise ValueError(
+          f"up_selector must have shape {(N, K)}, got {self.up_selector.shape}."
+        )
+
+    # Diniz/MATLAB-style regular prefixing.
+    x_pref = np.concatenate([np.zeros(N - 1, dtype=np.complex128), x])
+
+    d_pref = np.concatenate([np.zeros(L, dtype=np.complex128), d])
+
+    # Internal state.
+    w = self.w.astype(np.complex128).copy()
+    Xap = np.zeros((N, Pp), dtype=np.complex128)
+    u1 = np.zeros(Pp, dtype=np.complex128)
+    u1[0] = 1.0
+
+    eye = np.eye(Pp, dtype=np.complex128)
+
+    y_hist = np.zeros(K, dtype=np.complex128)
+    e_hist = np.zeros(K, dtype=np.complex128)
+    w_hist = np.zeros((K + 1, N), dtype=np.complex128)
+
+    update_flags = np.zeros(K, dtype=bool)
+    selected_mask_hist = np.zeros((K, N), dtype=bool)
+    selected_count_hist = np.zeros(K, dtype=np.int32)
+    mu_sm_hist = np.zeros(K, dtype=np.float64)
+    post_e_hist = np.zeros((K, Pp), dtype=np.complex128)
+
+    w_hist[0] = w
+
+    for k in range(K):
+      # Shift AP matrix and insert newest regressor.
+      Xap[:, 1:] = Xap[:, :-1]
+      Xap[:, 0] = x_pref[k:k + N][::-1]
+
+      # Diniz convention:
+      # output_ap = Xap^H w
+      # error_ap_conj = conj(d_ap) - output_ap
+      d_ap = d_pref[k:k + Pp][::-1]
+      y_ap = Xap.conj().T @ w
+      e_ap_conj = np.conj(d_ap) - y_ap
+
+      y_hist[k] = y_ap[0]
+      e_hist[k] = e_ap_conj[0]
+
+      e0 = e_ap_conj[0]
+      abs_e0 = float(np.abs(e0))
+
+      if train and abs_e0 > self.gamma_bar:
+        update_flags[k] = True
+        mu_sm = 1.0 - self.gamma_bar / max(abs_e0, self.eps)
+      else:
+        mu_sm = 0.0
+
+      mu_sm_hist[k] = mu_sm
+
+      # Build C(k) selector.
+      mask = self.selectMask(Xap=Xap, k=k)
+
+      selected_mask_hist[k] = mask.astype(bool)
+      selected_count_hist[k] = int(np.sum(mask))
+
+      if train and mu_sm > 0.0:
+        Xsel = Xap * mask[:, None]
+
+        R = Xap.conj().T @ Xsel
+        R_reg = R + self.delta * eye
+
+        rhs = mu_sm * e0 * u1
+
+        # Diniz MATLAB uses inv(...). Solve is numerically cleaner but equivalent.
+        try:
+          g = np.linalg.solve(R_reg, rhs)
+        except np.linalg.LinAlgError:
+          g = np.linalg.pinv(R_reg) @ rhs
+
+        w = w + Xsel @ g
+
+      y_post_ap = Xap.conj().T @ w
+      post_e_hist[k] = np.conj(d_ap) - y_post_ap
+
+      w_hist[k + 1] = w
+
+    if train:
+      self.w = w.astype(np.complex64)
+
+    self.update_flags = update_flags
+    self.selected_mask_hist = selected_mask_hist
+    self.selected_count_hist = selected_count_hist
+    self.mu_sm_hist = mu_sm_hist
+    self.post_e_hist = post_e_hist
+
+    return (
+      y_hist.astype(np.complex64),
+      e_hist.astype(np.complex64),
+      w_hist.astype(np.complex64),
+    )
+
+  def selectMask(self, Xap: Array, k: int) -> Array:
+    """
+    Build selector mask C(k).
+
+    topEnergy:
+      choose Mbar rows of Xap with largest row energy.
+
+    random:
+      random 0/1 selector, like MATLAB randint(N,K,[0 1]).
+
+    external:
+      use self.up_selector[:, k].
+    """
+    N = Xap.shape[0]
+
+    if self.selector_mode == "external":
+      mask = np.asarray(self.up_selector[:, k], dtype=np.float64)
+      return np.clip(mask, 0.0, 1.0)
+
+    if self.selector_mode == "random":
+      return np.random.randint(0, 2, size=N).astype(np.float64)
+
+    # selector_mode == "topEnergy"
+    row_energy = np.sum(np.abs(Xap) ** 2, axis=1)
+    mbar = min(self.max_update, N)
+
+    idx = np.argsort(row_energy)[-mbar:]
+
+    mask = np.zeros(N, dtype=np.float64)
+    mask[idx] = 1.0
+
+    return mask
+
+  def getUpdateRate(self) -> float:
+    if not hasattr(self, "update_flags") or self.update_flags.size == 0:
+      return 0.0
+    return float(np.mean(self.update_flags))
+
+  def updateRate(self) -> float:
+    return self.getUpdateRate()
+
+  def getAverageSelectedCount(self) -> float:
+    if not hasattr(self, "selected_count_hist") or self.selected_count_hist.size == 0:
+      return 0.0
+    return float(np.mean(self.selected_count_hist))
+
+  def analyzeUpdates(self) -> Dict[str, Any]:
+    if not hasattr(self, "update_flags"):
+      return dict(
+        gamma_bar=float(self.gamma_bar),
+        projection_order=int(self.P),
+        projection_dimension=int(self.P + 1),
+        max_update=int(self.max_update),
+        selector_mode=self.selector_mode,
+        n_updates=0,
+        update_rate=0.0,
+        average_selected_count=0.0,
+        mean_mu_sm=0.0,
+        min_mu_sm=0.0,
+        max_mu_sm=0.0,
+      )
+
+    active_mu = self.mu_sm_hist[self.update_flags]
+
+    if active_mu.size > 0:
+      mean_mu = float(np.mean(active_mu))
+      min_mu = float(np.min(active_mu))
+      max_mu = float(np.max(active_mu))
+    else:
+      mean_mu = 0.0
+      min_mu = 0.0
+      max_mu = 0.0
+
+    return dict(
+      gamma_bar=float(self.gamma_bar),
+      projection_order=int(self.P),
+      projection_dimension=int(self.P + 1),
+      max_update=int(self.max_update),
+      selector_mode=self.selector_mode,
+      delta=float(self.delta),
+      n_updates=int(np.sum(self.update_flags)),
+      update_rate=self.getUpdateRate(),
+      average_selected_count=self.getAverageSelectedCount(),
+      mean_mu_sm=mean_mu,
+      min_mu_sm=min_mu,
+      max_mu_sm=max_mu,
+    )
+
+  def printUpdateAnalysis(self) -> None:
+    a = self.analyzeUpdates()
+
+    print("\n" + "=" * 64)
+    print("DINIZ-STYLE SM-PUAP UPDATE ANALYSIS")
+    print("=" * 64)
+    print(f"Projection order P/L:          {a['projection_order']}")
+    print(f"Projection dimension L+1:      {a['projection_dimension']}")
+    print(f"max_update Mbar:               {a['max_update']}")
+    print(f"selector_mode:                 {a['selector_mode']}")
+    print(f"gamma_bar:                     {a['gamma_bar']:.6g}")
+    print(f"delta/gamma:                   {a['delta']:.6g}")
+    print(f"Number of updates:             {a['n_updates']}")
+    print(f"Update rate:                   {a['update_rate']:.4f}")
+    print(f"Average selected count:        {a['average_selected_count']:.3f}")
+    print(f"Mean mu_sm:                    {a['mean_mu_sm']:.6f}")
+    print(f"Min mu_sm:                     {a['min_mu_sm']:.6f}")
+    print(f"Max mu_sm:                     {a['max_mu_sm']:.6f}")
+    print("=" * 64)
