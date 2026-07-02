@@ -20,3 +20,4 @@ vivado.log
 /lib/fft/sram_32x16_1rw/
 *.Identifier
 *Zone.Identifier
+.mplconfig
