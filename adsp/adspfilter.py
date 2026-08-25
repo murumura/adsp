@@ -3229,3 +3229,710 @@ class SMPartialUpdateAffineProjection(BaseLMS):
     print(f"Min mu_sm:                     {a['min_mu_sm']:.6f}")
     print(f"Max mu_sm:                     {a['max_mu_sm']:.6f}")
     print("=" * 64)
+
+# -----------------------------------------------------------------------------
+# Diniz Chapter 7 - Lattice RLS
+# -----------------------------------------------------------------------------
+
+@dataclass
+class BaseLatticeRLS(BaseLMS):
+  """Shared base for Diniz Algorithm 7.1 and 7.2."""
+
+  lam: float = 0.99
+  epsilon: float = 1e-3
+  eps: float = 1e-12
+  dtype: object = np.float64
+
+  def __post_init__(self):
+    self.mu = None
+    super().__post_init__()
+
+    if not (0.0 < self.lam <= 1.0):
+      raise ValueError(f"lam must satisfy 0 < lam <= 1, got {self.lam}.")
+    if self.epsilon <= 0.0:
+      raise ValueError(f"epsilon must be > 0, got {self.epsilon}.")
+    if self.eps <= 0.0:
+      raise ValueError(f"eps must be > 0, got {self.eps}.")
+
+    self.resetState()
+
+  def checkRealInput(self, x: Array, d: Array) -> Tuple[Array, Array]:
+    x = np.asarray(x)
+    d = np.asarray(d)
+
+    if np.iscomplexobj(x) and np.any(np.abs(np.imag(x)) > self.eps):
+      raise ValueError("Diniz Algorithm 7.1/7.2 here implements the real-valued textbook form.")
+    if np.iscomplexobj(d) and np.any(np.abs(np.imag(d)) > self.eps):
+      raise ValueError("Diniz Algorithm 7.1/7.2 here implements the real-valued textbook form.")
+
+    x = np.asarray(np.real(x), dtype=self.dtype)
+    d = np.asarray(np.real(d), dtype=self.dtype)
+
+    if x.ndim != 1 or d.ndim != 1:
+      raise ValueError(f"x and d must be 1-D, got {x.shape} and {d.shape}.")
+    if len(x) != len(d):
+      raise ValueError(f"x and d must have same length, got {len(x)} and {len(d)}.")
+
+    return x, d
+
+  def posGuard(self, x: float) -> float:
+    return max(float(x), self.eps)
+
+  def sqrtOneMinusSquare(self, x: float) -> float:
+    return math.sqrt(max(1.0 - float(x) * float(x), self.eps))
+
+
+@dataclass
+class LatticeRLS(BaseLatticeRLS):
+  """
+  Diniz Algorithm 7.1 - Lattice RLS based on a posteriori errors.
+
+  self.w stores the lattice feedforward coefficients:
+      self.w[i] = v_i(k)
+
+  These are lattice-basis coefficients, not direct-form transversal FIR taps.
+  """
+
+  delta: Array = field(init=False, repr=False)
+  delta_d: Array = field(init=False, repr=False)
+  xi_b: Array = field(init=False, repr=False)
+  xi_f: Array = field(init=False, repr=False)
+  gamma: Array = field(init=False, repr=False)
+  eb_prev: Array = field(init=False, repr=False)
+
+  def resetState(self) -> None:
+    M = self.n_coef
+
+    self.delta = np.zeros(M, dtype=self.dtype)
+    self.delta_d = np.zeros(M, dtype=self.dtype)
+
+    self.xi_b = np.full(M + 1, self.epsilon, dtype=self.dtype)
+    self.xi_f = np.full(M + 1, self.epsilon, dtype=self.dtype)
+
+    self.gamma = np.ones(M + 1, dtype=self.dtype)
+    self.eb_prev = np.zeros(M + 1, dtype=self.dtype)
+
+    self.w = np.zeros(M, dtype=np.complex64)
+
+  def step(self, xk: float, dk: float) -> Dict[str, Array]:
+    M = self.n_coef
+
+    delta_prev = self.delta.copy()
+    delta_d_prev = self.delta_d.copy()
+    xi_b_prev = self.xi_b.copy()
+    xi_f_prev = self.xi_f.copy()
+    gamma_prev = self.gamma.copy()
+    eb_prev = self.eb_prev.copy()
+
+    ef = np.zeros(M + 1, dtype=self.dtype)
+    eb = np.zeros(M + 1, dtype=self.dtype)
+    error = np.zeros(M + 1, dtype=self.dtype)
+    gamma = np.ones(M + 1, dtype=self.dtype)
+    xi_b = np.zeros(M + 1, dtype=self.dtype)
+    xi_f = np.zeros(M + 1, dtype=self.dtype)
+
+    delta = np.empty(M, dtype=self.dtype)
+    delta_d = np.empty(M, dtype=self.dtype)
+    kappa_b = np.empty(M, dtype=self.dtype)
+    kappa_f = np.empty(M, dtype=self.dtype)
+    v = np.empty(M, dtype=self.dtype)
+
+    # Algorithm 7.1 order-0 initialization, Eqs. (7.35)-(7.36).
+    gamma[0] = 1.0
+    eb[0] = ef[0] = xk
+    xi_b[0] = xi_f[0] = xk * xk + self.lam * xi_f_prev[0]
+    error[0] = dk
+
+    for i in range(M):
+      # Eq. (7.51): time update of prediction cross-correlation.
+      delta[i] = self.lam * delta_prev[i] + eb_prev[i] * ef[i] / self.posGuard(gamma_prev[i])
+
+      # Eq. (7.60): order update of conversion factor.
+      gamma[i + 1] = gamma[i] - eb[i] * eb[i] / self.posGuard(xi_b[i])
+
+      # Reflection coefficients.
+      kappa_b[i] = delta[i] / self.posGuard(xi_f[i])
+      kappa_f[i] = delta[i] / self.posGuard(xi_b_prev[i])
+
+      # Eqs. (7.34), (7.33): backward/forward a posteriori errors.
+      eb[i + 1] = eb_prev[i] - kappa_b[i] * ef[i]
+      ef[i + 1] = ef[i] - kappa_f[i] * eb_prev[i]
+
+      # Eqs. (7.27), (7.31): minimum LS error order updates.
+      xi_b[i + 1] = xi_b_prev[i] - delta[i] * kappa_b[i]
+      xi_f[i + 1] = xi_f[i] - delta[i] * kappa_f[i]
+
+      # Eqs. (7.64), (7.67), (7.68): joint-process feedforward section.
+      delta_d[i] = self.lam * delta_d_prev[i] + eb[i] * error[i] / self.posGuard(gamma[i])
+      v[i] = delta_d[i] / self.posGuard(xi_b[i])
+      error[i + 1] = error[i] - v[i] * eb[i]
+
+    self.delta = delta
+    self.delta_d = delta_d
+    self.xi_b = xi_b
+    self.xi_f = xi_f
+    self.gamma = gamma
+    self.eb_prev = eb
+    self.w = v.astype(np.complex64)
+
+    return {
+      "y": np.asarray(dk - error[-1], dtype=self.dtype)[()],
+      "e": np.asarray(error[-1], dtype=self.dtype)[()],
+      "e_order": error,
+      "ef": ef,
+      "eb": eb,
+      "delta": delta,
+      "delta_d": delta_d,
+      "gamma": gamma,
+      "xi_f": xi_f,
+      "xi_b": xi_b,
+      "kappa_f": kappa_f,
+      "kappa_b": kappa_b,
+      "v": v,
+    }
+
+  def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
+    x, d = self.checkRealInput(x, d)
+
+    N = len(x)
+    M = self.n_coef
+
+    saved_state = None
+    if not train:
+      saved_state = (
+        self.delta.copy(), self.delta_d.copy(), self.xi_b.copy(), self.xi_f.copy(), self.gamma.copy(),
+        self.eb_prev.copy(), self.w.copy(),
+      )
+
+    y_hist = np.empty(N, dtype=self.dtype)
+    e_hist = np.empty(N, dtype=self.dtype)
+    w_hist = np.empty((N + 1, M), dtype=np.complex64)
+    w_hist[0] = self.w
+
+    for k in range(N):
+      result = self.step(x[k], d[k])
+      y_hist[k] = result["y"]
+      e_hist[k] = result["e"]
+      w_hist[k + 1] = result["v"]
+
+    if not train:
+      self.delta, self.delta_d, self.xi_b, self.xi_f, self.gamma, self.eb_prev, self.w = saved_state
+
+    return y_hist, e_hist, w_hist
+
+
+@dataclass
+class NormalizedLatticeRLS(BaseLatticeRLS):
+  """
+  Diniz Algorithm 7.2 - Normalized lattice RLS based on a posteriori errors.
+
+  The algorithm directly produces normalized errors and normalized correlations:
+      delta_bar, delta_d_bar, ef_bar, eb_bar, e_bar.
+
+  There is no physical direct-form FIR coefficient vector in Algorithm 7.2, so inherited self.w is not used.
+  """
+
+  delta_bar: Array = field(init=False, repr=False)
+  delta_d_bar: Array = field(init=False, repr=False)
+  eb_bar_prev: Array = field(init=False, repr=False)
+
+  sigma_x2: float = field(init=False)
+  sigma_d2: float = field(init=False)
+
+  def resetState(self) -> None:
+    M = self.n_coef
+
+    self.delta_bar = np.zeros(M, dtype=self.dtype)
+    self.delta_d_bar = np.zeros(M, dtype=self.dtype)
+    self.eb_bar_prev = np.zeros(M + 1, dtype=self.dtype)
+
+    self.sigma_x2 = float(self.epsilon)
+    self.sigma_d2 = float(self.epsilon)
+
+    self.w = np.zeros(M, dtype=np.complex64)
+
+  def step(self, xk: float, dk: float) -> Dict[str, Array]:
+    M = self.n_coef
+
+    delta_prev = self.delta_bar.copy()
+    delta_d_prev = self.delta_d_bar.copy()
+    eb_prev = self.eb_bar_prev.copy()
+
+    # Algorithm 7.2 input/reference power recursions.
+    self.sigma_x2 = self.lam * self.sigma_x2 + xk * xk
+    self.sigma_d2 = self.lam * self.sigma_d2 + dk * dk
+
+    sigma_x = math.sqrt(self.posGuard(self.sigma_x2))
+    sigma_d = math.sqrt(self.posGuard(self.sigma_d2))
+
+    ef = np.zeros(M + 1, dtype=self.dtype)
+    eb = np.zeros(M + 1, dtype=self.dtype)
+    error = np.zeros(M + 1, dtype=self.dtype)
+
+    delta = np.empty(M, dtype=self.dtype)
+    delta_d = np.empty(M, dtype=self.dtype)
+    eta_f = np.empty(M, dtype=self.dtype)
+    eta_b = np.empty(M, dtype=self.dtype)
+    eta_d = np.empty(M, dtype=self.dtype)
+
+    # Order-0 normalized innovations.
+    eb[0] = ef[0] = xk / sigma_x
+    error[0] = dk / sigma_d
+
+    for i in range(M):
+      sqrt_eb_prev = self.sqrtOneMinusSquare(eb_prev[i])
+      sqrt_ef = self.sqrtOneMinusSquare(ef[i])
+
+      # Eq. (7.81): normalized forward/backward correlation.
+      delta[i] = delta_prev[i] * sqrt_eb_prev * sqrt_ef + eb_prev[i] * ef[i]
+
+      sqrt_delta = self.sqrtOneMinusSquare(delta[i])
+
+      # Eqs. (7.91)-(7.92).
+      eta_f[i] = 1.0 / (sqrt_delta * sqrt_eb_prev)
+      eta_b[i] = 1.0 / (sqrt_delta * sqrt_ef)
+
+      # Eqs. (7.84), (7.83).
+      eb[i + 1] = eta_b[i] * (eb_prev[i] - delta[i] * ef[i])
+      ef[i + 1] = eta_f[i] * (ef[i] - delta[i] * eb_prev[i])
+
+      sqrt_eb = self.sqrtOneMinusSquare(eb[i])
+      sqrt_error = self.sqrtOneMinusSquare(error[i])
+
+      # Eq. (7.89): normalized joint-process correlation.
+      delta_d[i] = delta_d_prev[i] * sqrt_eb * sqrt_error + error[i] * eb[i]
+
+      # Eq. (7.93) and Eq. (7.88).
+      eta_d[i] = 1.0 / (sqrt_eb * self.sqrtOneMinusSquare(delta_d[i]))
+      error[i + 1] = eta_d[i] * (error[i] - delta_d[i] * eb[i])
+
+    self.delta_bar = delta
+    self.delta_d_bar = delta_d
+    self.eb_bar_prev = eb
+
+    return {
+      "e_bar": np.asarray(error[-1], dtype=self.dtype)[()],
+      "e_bar_order": error,
+      "ef_bar": ef,
+      "eb_bar": eb,
+      "delta_bar": delta,
+      "delta_d_bar": delta_d,
+      "eta_f": eta_f,
+      "eta_b": eta_b,
+      "eta_d": eta_d,
+      "sigma_x": np.asarray(sigma_x, dtype=self.dtype)[()],
+      "sigma_d": np.asarray(sigma_d, dtype=self.dtype)[()],
+    }
+
+  def __call__(self, x: Array, d: Array, train: bool = True) -> Dict[str, Array]:
+    x, d = self.checkRealInput(x, d)
+
+    N = len(x)
+    M = self.n_coef
+
+    saved_state = None
+    if not train:
+      saved_state = (
+        self.delta_bar.copy(), self.delta_d_bar.copy(), self.eb_bar_prev.copy(), self.sigma_x2, self.sigma_d2,
+      )
+
+    e_bar_hist = np.empty(N, dtype=self.dtype)
+    ef_bar_hist = np.empty((N, M + 1), dtype=self.dtype)
+    eb_bar_hist = np.empty((N, M + 1), dtype=self.dtype)
+    delta_bar_hist = np.empty((N, M), dtype=self.dtype)
+    delta_d_bar_hist = np.empty((N, M), dtype=self.dtype)
+    eta_f_hist = np.empty((N, M), dtype=self.dtype)
+    eta_b_hist = np.empty((N, M), dtype=self.dtype)
+    eta_d_hist = np.empty((N, M), dtype=self.dtype)
+
+    for k in range(N):
+      result = self.step(x[k], d[k])
+
+      e_bar_hist[k] = result["e_bar"]
+      ef_bar_hist[k] = result["ef_bar"]
+      eb_bar_hist[k] = result["eb_bar"]
+      delta_bar_hist[k] = result["delta_bar"]
+      delta_d_bar_hist[k] = result["delta_d_bar"]
+      eta_f_hist[k] = result["eta_f"]
+      eta_b_hist[k] = result["eta_b"]
+      eta_d_hist[k] = result["eta_d"]
+
+    if not train:
+      self.delta_bar, self.delta_d_bar, self.eb_bar_prev, self.sigma_x2, self.sigma_d2 = saved_state
+
+    return {
+      "e_bar": e_bar_hist,
+      "ef_bar_hist": ef_bar_hist,
+      "eb_bar_hist": eb_bar_hist,
+      "delta_bar_hist": delta_bar_hist,
+      "delta_d_bar_hist": delta_d_bar_hist,
+      "eta_f_hist": eta_f_hist,
+      "eta_b_hist": eta_b_hist,
+      "eta_d_hist": eta_d_hist,
+    }
+
+@dataclass
+class ErrorFeedbackLatticeRLS(LatticeRLS):
+  """
+  Diniz Algorithm 7.3 - Error-feedback LRLS based on a posteriori errors.
+
+  Differences from Algorithm 7.1:
+    kappa_f(k,i) is recursively updated by Eq. (7.94).
+    kappa_b(k,i) is recursively updated by Eq. (7.95).
+    v_i(k)       is recursively updated by Eq. (7.96).
+
+  self.w stores the feedforward lattice coefficients v_i(k).
+  """
+
+  kappa_f: Array = field(init=False, repr=False)
+  kappa_b: Array = field(init=False, repr=False)
+  xi_b_prev2: Array = field(init=False, repr=False)
+
+  def resetState(self) -> None:
+    # Reuse Algorithm 7.1 initialization for delta, xi_f, xi_b, gamma, eb_prev, and v.
+    super().resetState()
+
+    M = self.n_coef
+    self.kappa_f = np.zeros(M, dtype=self.dtype)
+    self.kappa_b = np.zeros(M, dtype=self.dtype)
+
+    # Algorithm 7.3 additionally requires xi_b(-2,i) because Eq. (7.94) uses xi_b(k-2,i).
+    self.xi_b_prev2 = np.full(M + 1, self.epsilon, dtype=self.dtype)
+
+  def step(self, xk: float, dk: float) -> Dict[str, Array]:
+    M = self.n_coef
+
+    # Saved states correspond to time k-1, except xi_b_prev2 = xi_b(k-2,i).
+    delta_prev = self.delta.copy()
+    kappa_f_prev = self.kappa_f.copy()
+    kappa_b_prev = self.kappa_b.copy()
+    v_prev = np.asarray(self.w.real, dtype=self.dtype)
+
+    gamma_prev = self.gamma.copy()
+    eb_prev = self.eb_prev.copy()
+
+    xi_f_prev = self.xi_f.copy()
+    xi_b_prev = self.xi_b.copy()
+    xi_b_prev2 = self.xi_b_prev2.copy()
+
+    ef = np.zeros(M + 1, dtype=self.dtype)
+    eb = np.zeros(M + 1, dtype=self.dtype)
+    error = np.zeros(M + 1, dtype=self.dtype)
+    gamma = np.ones(M + 1, dtype=self.dtype)
+
+    xi_f = np.zeros(M + 1, dtype=self.dtype)
+    xi_b = np.zeros(M + 1, dtype=self.dtype)
+
+    delta = np.empty(M, dtype=self.dtype)
+    kappa_f = np.empty(M, dtype=self.dtype)
+    kappa_b = np.empty(M, dtype=self.dtype)
+    v = np.empty(M, dtype=self.dtype)
+
+    # Algorithm 7.3 order-0 initialization, Eqs. (7.35)-(7.36).
+    gamma[0] = 1.0
+    eb[0] = ef[0] = xk
+    xi_f[0] = xi_b[0] = xk * xk + self.lam * xi_f_prev[0]
+    error[0] = dk
+
+    for i in range(M):
+      gamma_prev_i = self.posGuard(gamma_prev[i])
+      gamma_i = self.posGuard(gamma[i])
+
+      xi_f_i = self.posGuard(xi_f[i])
+      xi_f_prev_i = self.posGuard(xi_f_prev[i])
+
+      xi_b_i = self.posGuard(xi_b[i])
+      xi_b_prev_i = self.posGuard(xi_b_prev[i])
+      xi_b_prev2_i = self.posGuard(xi_b_prev2[i])
+
+      # Eq. (7.51): prediction cross-correlation time update.
+      pred_corr = eb_prev[i] * ef[i] / gamma_prev_i
+      delta[i] = self.lam * delta_prev[i] + pred_corr
+
+      # Eq. (7.60): conversion-factor order update.
+      gamma[i + 1] = gamma[i] - eb[i] * eb[i] / xi_b_i
+
+      # Eq. (7.94): direct recursive forward reflection-coefficient update.
+      kappa_f[i] = gamma_prev[i + 1] / gamma_prev_i * (
+        kappa_f_prev[i] + pred_corr / (self.lam * xi_b_prev2_i)
+      )
+
+      # Eq. (7.95): direct recursive backward reflection-coefficient update.
+      kappa_b[i] = gamma[i + 1] / gamma_prev_i * (
+        kappa_b_prev[i] + pred_corr / (self.lam * xi_f_prev_i)
+      )
+
+      # Eqs. (7.34), (7.33): prediction-error order updates.
+      eb[i + 1] = eb_prev[i] - kappa_b[i] * ef[i]
+      ef[i + 1] = ef[i] - kappa_f[i] * eb_prev[i]
+
+      # Eqs. (7.31), (7.27): minimum LS prediction-error updates.
+      xi_f[i + 1] = xi_f[i] - delta[i] * delta[i] / xi_b_prev_i
+      xi_b[i + 1] = xi_b_prev[i] - delta[i] * delta[i] / xi_f_i
+
+      # Eq. (7.96): direct recursive feedforward-coefficient update.
+      ff_corr = error[i] * eb[i] / gamma_i
+      v[i] = gamma[i + 1] / gamma_i * (
+        v_prev[i] + ff_corr / (self.lam * xi_b_prev_i)
+      )
+
+      # Eq. (7.68): joint-process a posteriori output-error update.
+      error[i + 1] = error[i] - v[i] * eb[i]
+
+    # Shift time states: k-2 <- k-1, k-1 <- k.
+    self.xi_b_prev2 = xi_b_prev
+    self.xi_b = xi_b
+    self.xi_f = xi_f
+
+    self.delta = delta
+    self.gamma = gamma
+    self.eb_prev = eb
+
+    self.kappa_f = kappa_f
+    self.kappa_b = kappa_b
+    self.w = v.astype(np.complex64)
+
+    return {
+      "y": np.asarray(dk - error[-1], dtype=self.dtype)[()],
+      "e": np.asarray(error[-1], dtype=self.dtype)[()],
+      "e_order": error,
+      "ef": ef,
+      "eb": eb,
+      "delta": delta,
+      "gamma": gamma,
+      "xi_f": xi_f,
+      "xi_b": xi_b,
+      "kappa_f": kappa_f,
+      "kappa_b": kappa_b,
+      "v": v,
+    }
+
+  def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
+    # LatticeRLS.__call__ already provides y/e/v histories. Only preserve the extra Algorithm 7.3 states for train=False.
+    if train:
+      return super().__call__(x, d, train=True)
+
+    extra_state = (self.kappa_f.copy(), self.kappa_b.copy(), self.xi_b_prev2.copy())
+    result = super().__call__(x, d, train=False)
+    self.kappa_f, self.kappa_b, self.xi_b_prev2 = extra_state
+
+    return result
+
+@dataclass
+class APrioriLatticeRLS(LatticeRLS):
+  """
+  Diniz Algorithm 7.4 - LRLS based on a priori errors.
+
+  Main difference from Algorithm 7.1:
+    - Current prediction errors use kappa_f(k-1,i), kappa_b(k-1,i).
+    - Current joint-process error uses v_i(k-1).
+    - Current a priori errors are then used to update delta, delta_D, kappa, and v.
+
+  self.w stores the current feedforward lattice coefficients v_i(k).
+  """
+
+  kappa_f: Array = field(init=False, repr=False)
+  kappa_b: Array = field(init=False, repr=False)
+
+  def resetState(self) -> None:
+    super().resetState()
+
+    M = self.n_coef
+
+    # Algorithm 7.4:
+    #   kappa_f(-1,i) = kappa_b(-1,i) = 0
+    self.kappa_f = np.zeros(M, dtype=self.dtype)
+    self.kappa_b = np.zeros(M, dtype=self.dtype)
+
+    # Eq. (7.103) with delta_D(-1,i)=0 implies v_i(-1)=0.
+    self.w = np.zeros(M, dtype=np.complex64)
+
+  def step(self, xk: float, dk: float) -> Dict[str, Array]:
+    M = self.n_coef
+
+    # States available at the beginning of time k.
+    delta_prev = self.delta.copy()
+    delta_d_prev = self.delta_d.copy()
+
+    xi_b_prev = self.xi_b.copy()
+    xi_f_prev = self.xi_f.copy()
+    gamma_prev = self.gamma.copy()
+
+    eb_prev = self.eb_prev.copy()
+
+    kappa_f_prev = self.kappa_f.copy()
+    kappa_b_prev = self.kappa_b.copy()
+    v_prev = np.asarray(self.w.real, dtype=self.dtype)
+
+    # Current-time order variables, i = 0 ... N+1.
+    ef = np.zeros(M + 1, dtype=self.dtype)
+    eb = np.zeros(M + 1, dtype=self.dtype)
+    error = np.zeros(M + 1, dtype=self.dtype)
+
+    gamma = np.ones(M + 1, dtype=self.dtype)
+    xi_b = np.zeros(M + 1, dtype=self.dtype)
+    xi_f = np.zeros(M + 1, dtype=self.dtype)
+
+    # Current-time per-stage variables, i = 0 ... N.
+    delta = np.empty(M, dtype=self.dtype)
+    delta_d = np.empty(M, dtype=self.dtype)
+    kappa_f = np.empty(M, dtype=self.dtype)
+    kappa_b = np.empty(M, dtype=self.dtype)
+    v = np.empty(M, dtype=self.dtype)
+
+    # -------------------------------------------------------------------------
+    # Algorithm 7.4 order-0 initialization.
+    # -------------------------------------------------------------------------
+
+    gamma[0] = 1.0
+    eb[0] = ef[0] = xk
+    xi_b[0] = xi_f[0] = xk * xk + self.lam * xi_f_prev[0]
+    error[0] = dk
+
+    for i in range(M):
+      gamma_prev_i = self.posGuard(gamma_prev[i])
+      gamma_i = self.posGuard(gamma[i])
+
+      xi_b_i = self.posGuard(xi_b[i])
+      xi_b_prev_i = self.posGuard(xi_b_prev[i])
+
+      xi_f_i = self.posGuard(xi_f[i])
+
+      # -----------------------------------------------------------------------
+      # Eq. (7.97)
+      #
+      # delta(k,i) = lambda delta(k-1,i)
+      #            + gamma(k-1,i) e_b(k-1,i) e_f(k,i)
+      # -----------------------------------------------------------------------
+
+      delta[i] = (self.lam * delta_prev[i] + gamma_prev_i * eb_prev[i] * ef[i])
+
+      # -----------------------------------------------------------------------
+      # Eq. (7.100), shifted to current k.
+      #
+      # gamma(k,i+1) = gamma(k,i)
+      #              - gamma^2(k,i) e_b^2(k,i) / xi_b(k,i)
+      # -----------------------------------------------------------------------
+
+      gamma[i + 1] = (gamma[i] - gamma_i * gamma_i * eb[i] * eb[i] / xi_b_i)
+
+      # -----------------------------------------------------------------------
+      # Eqs. (7.99), (7.98)
+      #
+      # Important: current a priori errors use PREVIOUS-TIME coefficients.
+      # -----------------------------------------------------------------------
+
+      eb[i + 1] = eb_prev[i] - kappa_b_prev[i] * ef[i]
+      ef[i + 1] = ef[i] - kappa_f_prev[i] * eb_prev[i]
+
+      # -----------------------------------------------------------------------
+      # Current reflection coefficients.
+      #
+      # These are calculated AFTER the current a priori errors and are stored
+      # for use at time k+1.
+      # -----------------------------------------------------------------------
+
+      kappa_f[i] = delta[i] / xi_b_prev_i
+      kappa_b[i] = delta[i] / xi_f_i
+
+      # -----------------------------------------------------------------------
+      # Eqs. (7.31), (7.27)
+      # -----------------------------------------------------------------------
+
+      xi_f[i + 1] = (xi_f[i] - delta[i] * kappa_f[i])
+
+      xi_b[i + 1] = (xi_b_prev[i] - delta[i] * kappa_b[i])
+
+      # -----------------------------------------------------------------------
+      # Feedforward filtering.
+      #
+      # Eq. (7.101):
+      #   delta_D(k,i) = lambda delta_D(k-1,i)
+      #                + gamma(k,i) e_b(k,i) e(k,i)
+      # -----------------------------------------------------------------------
+
+      delta_d[i] = (self.lam * delta_d_prev[i]+ gamma_i * eb[i] * error[i])
+
+      # -----------------------------------------------------------------------
+      # Eq. (7.102):
+      #
+      #   e(k,i+1) = e(k,i) - v_i(k-1) e_b(k,i)
+      #
+      # Important: use v_prev here, NOT the newly calculated v_i(k).
+      # -----------------------------------------------------------------------
+
+      error[i + 1] = (error[i]- v_prev[i] * eb[i])
+
+      # -----------------------------------------------------------------------
+      # Eq. (7.103), current-time form used in Algorithm 7.4:
+      #
+      #   v_i(k) = delta_D(k,i) / xi_b(k,i)
+      #
+      # It is stored for use as v_i(k-1) at the next sample.
+      # -----------------------------------------------------------------------
+
+      v[i] = delta_d[i] / xi_b_i
+
+    # Commit k states. At the next call they become the k-1 states.
+    self.delta = delta
+    self.delta_d = delta_d
+
+    self.xi_b = xi_b
+    self.xi_f = xi_f
+    self.gamma = gamma
+
+    self.eb_prev = eb
+
+    self.kappa_f = kappa_f
+    self.kappa_b = kappa_b
+
+    self.w = v.astype(np.complex64)
+
+    # Algorithm 7.4 output error is already the a priori error.
+    e_final = error[-1]
+    y_final = dk - e_final
+
+    return {
+      "y": np.asarray(y_final, dtype=self.dtype)[()],
+      "e": np.asarray(e_final, dtype=self.dtype)[()],
+      "e_order": error,
+
+      "ef": ef,
+      "eb": eb,
+
+      "delta": delta,
+      "delta_d": delta_d,
+
+      "gamma": gamma,
+
+      "xi_f": xi_f,
+      "xi_b": xi_b,
+
+      "kappa_f": kappa_f,
+      "kappa_b": kappa_b,
+
+      "v": v,
+
+      # Useful for debugging Algorithm 7.4 causality.
+      "kappa_f_prev": kappa_f_prev,
+      "kappa_b_prev": kappa_b_prev,
+      "v_prev": v_prev,
+    }
+
+  def __call__(self, x: Array, d: Array, train: bool = True) -> Tuple[Array, Array, Array]:
+    # LatticeRLS.__call__ already provides y/e/v histories and calls self.step().
+    if train:
+      return super().__call__(x, d, train=True)
+
+    # Parent train=False restores the common LatticeRLS states. Preserve the
+    # Algorithm 7.4-specific previous reflection-coefficient states as well.
+    extra_state = (
+      self.kappa_f.copy(),
+      self.kappa_b.copy(),
+    )
+
+    result = super().__call__(x, d, train=False)
+
+    self.kappa_f, self.kappa_b = extra_state
+
+    return result
