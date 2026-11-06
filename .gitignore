@@ -21,3 +21,4 @@ vivado.log
 *.Identifier
 *Zone.Identifier
 .mplconfig
+tree

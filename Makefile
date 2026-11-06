@@ -12,6 +12,7 @@ docker-run:
 	@bash $(DockerDir)/pysim-run.sh
 
 # Launch Jupyter Notebook
+# access http://127.0.0.1:1234/tree
 nb:
 	jupyter notebook --notebook-dir=./ --ip 0.0.0.0 --port 8888 --no-browser --allow-root
 
